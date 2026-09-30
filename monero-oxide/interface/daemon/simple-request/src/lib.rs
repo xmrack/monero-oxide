@@ -101,9 +101,9 @@ impl SimpleRequestTransport {
     let authentication = if url.contains('@') {
       // Parse out the username and password
       let url_clone = Zeroizing::new(url);
-      let split_url = url_clone.split('@').collect::<Vec<_>>();
-      let mut userpass = split_url[0];
-      url = split_url[1 ..].join("@");
+      let (mut userpass, host) =
+        url_clone.rsplit_once('@').expect("URL contained '@' yet couldn't be split on '@'");
+      url = String::from(host);
 
       // If there was additionally a protocol string, restore that to the daemon URL
       if userpass.contains("://") {
