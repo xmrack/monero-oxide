@@ -197,6 +197,9 @@ pub enum SendError {
   /// one payment prevents creating a valid transaction
   #[error("only one output and no change address")]
   NoChange,
+  /// An address had a key which was the identity or torsioned.
+  #[error("invalid address")]
+  InvalidAddress,
   /// Multiple addresses had payment IDs specified.
   ///
   /// Only one payment ID is allowed per transaction.
@@ -354,6 +357,18 @@ impl SignableTransaction {
       }
       if change_count > 1 {
         Err(SendError::IncorrectSerialization)?;
+      }
+    }
+
+    // Reject addresses whose keys are the identity or torsioned
+    for payment in &self.payments {
+      let address = payment.address();
+      for key in [address.spend(), address.view()] {
+        let key = key.into();
+        use curve25519_dalek::traits::IsIdentity as _;
+        if key.is_identity() || !key.is_torsion_free() {
+          Err(SendError::InvalidAddress)?;
+        }
       }
     }
 
