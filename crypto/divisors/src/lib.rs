@@ -57,6 +57,17 @@ pub trait DivisorCurve: Group + ConstantTimeEq + ConditionallySelectable + Zeroi
   ///
   /// This function may run in time variable to if the point is the identity.
   fn to_xy(point: Self) -> Option<(Self::FieldElement, Self::FieldElement)>;
+
+  /// Projective coordinates `(X, Y, Z)` of a point, where `x = X / Z`, `y = Y / Z`, and `Z = 0`
+  /// if and only if the point is the identity.
+  ///
+  /// This function may run in time variable to if the point is the identity.
+  fn to_xyz(point: Self) -> (Self::FieldElement, Self::FieldElement, Self::FieldElement) {
+    match Self::to_xy(point) {
+      Some((x, y)) => (x, y, Self::FieldElement::ONE),
+      None => (Self::FieldElement::ZERO, Self::FieldElement::ONE, Self::FieldElement::ZERO),
+    }
+  }
 }
 
 type Xy<C> = (<C as DivisorCurve>::FieldElement, <C as DivisorCurve>::FieldElement);

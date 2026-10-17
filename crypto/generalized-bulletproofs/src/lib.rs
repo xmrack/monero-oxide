@@ -5,7 +5,7 @@
 #![allow(non_snake_case)]
 
 use core::fmt;
-use std_shims::{vec, vec::Vec, collections::HashSet};
+use std_shims::{vec, vec::Vec, collections::HashSet, sync::Arc};
 
 use zeroize::{Zeroize, ZeroizeOnDrop};
 use subtle::ConditionallySelectable;
@@ -27,6 +27,8 @@ pub mod transcript;
 pub(crate) mod inner_product;
 
 pub(crate) mod lincomb;
+
+mod fixed_base;
 
 /// The arithmetic circuit proof.
 pub mod arithmetic_circuit_proof;
@@ -59,6 +61,8 @@ pub struct Generators<C: Ciphersuite> {
   g_bold: Vec<C::G>,
   h_bold: Vec<C::G>,
   h_sum: Vec<C::G>,
+
+  tables: Option<Arc<dyn fixed_base::VerifyTables<C>>>,
 }
 
 /// A batch verifier of proofs.
@@ -177,7 +181,7 @@ impl<C: Ciphersuite> Generators<C> {
       }
     }
 
-    Ok(Generators { g, h, g_bold, h_bold, h_sum })
+    Ok(Generators { g, h, g_bold, h_bold, h_sum, tables: None })
   }
 
   /// Create a `BatchVerifier` for proofs which use a consistent set of generators.
@@ -199,6 +203,9 @@ impl<C: Ciphersuite> Generators<C> {
   /// This function executes in variable time.
   #[must_use]
   pub fn verify(&self, verifier: BatchVerifier<C>) -> bool {
+    if let Some(res) = self.tables.as_ref().and_then(|tables| tables.verify(self, &verifier)) {
+      return res;
+    }
     multiexp_vartime(
       &[(verifier.g, self.g), (verifier.h, self.h)]
         .into_iter()
@@ -258,6 +265,21 @@ impl<C: Ciphersuite> Generators<C> {
       g_bold: &self.g_bold[.. generators],
       h_bold: &self.h_bold[.. generators],
     })
+  }
+}
+
+impl<C: Ciphersuite> Generators<C>
+where
+  C::G: ec_divisors::DivisorCurve,
+{
+  /// Use precomputed tables of the generators within `verify`, built on its first call.
+  ///
+  /// This does not change the result of `verify`. The tables cover a prefix of the generators,
+  /// bounded to 8 MiB.
+  #[must_use]
+  pub fn with_verification_tables(mut self) -> Self {
+    self.tables = fixed_base::verification_tables(&self);
+    self
   }
 }
 

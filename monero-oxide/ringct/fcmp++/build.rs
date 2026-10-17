@@ -132,7 +132,7 @@ where
                   {},
                   {},
                   {},
-                ).unwrap()
+                ).unwrap().with_verification_tables()
               }});
         ",
         id.clone().to_uppercase(),
@@ -179,12 +179,22 @@ fn generators() {
           pub static HELIOS_FCMP_GENERATORS: LazyLock<
             monero_fcmp_plus_plus_generators::FcmpGenerators<Helios>
           > =
-            LazyLock::new(monero_fcmp_plus_plus_generators::FcmpGenerators::<Helios>::new);
+            LazyLock::new(|| {{
+              let mut generators =
+                monero_fcmp_plus_plus_generators::FcmpGenerators::<Helios>::new();
+              generators.generators = generators.generators.with_verification_tables();
+              generators
+            }});
           /// The FCMP generators for Selene.
           pub static SELENE_FCMP_GENERATORS: LazyLock<
             monero_fcmp_plus_plus_generators::FcmpGenerators<Selene>
           > =
-            LazyLock::new(monero_fcmp_plus_plus_generators::FcmpGenerators::<Selene>::new);
+            LazyLock::new(|| {{
+              let mut generators =
+                monero_fcmp_plus_plus_generators::FcmpGenerators::<Selene>::new();
+              generators.generators = generators.generators.with_verification_tables();
+              generators
+            }});
       ",
       )
       .as_bytes(),

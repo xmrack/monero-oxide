@@ -35,13 +35,18 @@ multiexp = { version = "0.5", default-features = false, features = ["batch"] }
 flexible-transcript = { version = "0.3.4", default-features = false } # Needed minimum version for MSRV
 ff = { version = "0.13", default-features = false, features = ["alloc"] } # Needed feature for batch invert
 ciphersuite = { version = "0.4.2", default-features = false, features = ["alloc"] }
+ec-divisors = { path = "../divisors", default-features = false }
 
 [dev-dependencies]
 rand_core = { version = "0.6", features = ["getrandom"] }
 
+helioselene = { path = "../helioselene", features = ["alloc"] }
+ec-divisors = { path = "../divisors", features = ["ed25519"] }
+dalek-ff-group = { version = "0.5", default-features = false }
+
 ciphersuite = { version = "0.4", features = ["ristretto"] }
 
 [features]
-std = ["std-shims/std", "rand_core/std", "zeroize/std", "subtle/std", "blake2/std", "multiexp/std", "flexible-transcript/std", "ciphersuite/std"]
+std = ["std-shims/std", "rand_core/std", "zeroize/std", "subtle/std", "blake2/std", "multiexp/std", "flexible-transcript/std", "ciphersuite/std", "ec-divisors/std"]
 tests = ["std"]
 default = ["std"]

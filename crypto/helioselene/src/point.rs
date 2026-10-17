@@ -445,6 +445,10 @@ macro_rules! curve {
         let z: Self::FieldElement = Option::from(point.z.invert())?;
         Some((point.x * z, point.y * z))
       }
+
+      fn to_xyz(point: Self) -> (Self::FieldElement, Self::FieldElement, Self::FieldElement) {
+        (point.x, point.y, point.z)
+      }
     }
   };
 }
