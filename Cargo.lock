@@ -513,6 +513,7 @@ dependencies = [
  "ciphersuite",
  "ff",
  "flexible-transcript",
+ "helioselene",
  "multiexp",
  "rand_core",
  "std-shims",

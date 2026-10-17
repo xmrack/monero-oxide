@@ -12,7 +12,10 @@ use subtle::ConditionallySelectable;
 
 use multiexp::{multiexp, multiexp_vartime};
 use ciphersuite::{
-  group::{ff::Field as _, Group as _, GroupEncoding as _},
+  group::{
+    ff::{Field as _, PrimeFieldBits as _},
+    Group as _, GroupEncoding as _,
+  },
   Ciphersuite,
 };
 
@@ -25,6 +28,9 @@ pub(crate) use point_vector::PointVector;
 pub mod transcript;
 
 pub(crate) mod inner_product;
+
+mod ct_fixed_base;
+use ct_fixed_base::{Tables, Bold};
 
 pub(crate) mod lincomb;
 
@@ -59,6 +65,8 @@ pub struct Generators<C: Ciphersuite> {
   g_bold: Vec<C::G>,
   h_bold: Vec<C::G>,
   h_sum: Vec<C::G>,
+
+  tables: Tables<C::G>,
 }
 
 /// A batch verifier of proofs.
@@ -110,6 +118,8 @@ pub struct ProofGenerators<'a, C: Ciphersuite> {
 
   g_bold: &'a [C::G],
   h_bold: &'a [C::G],
+
+  tables: &'a Tables<C::G>,
 }
 
 impl<C: Ciphersuite> fmt::Debug for ProofGenerators<'_, C> {
@@ -177,7 +187,7 @@ impl<C: Ciphersuite> Generators<C> {
       }
     }
 
-    Ok(Generators { g, h, g_bold, h_bold, h_sum })
+    Ok(Generators { g, h, g_bold, h_bold, h_sum, tables: Tables::new() })
   }
 
   /// Create a `BatchVerifier` for proofs which use a consistent set of generators.
@@ -257,7 +267,48 @@ impl<C: Ciphersuite> Generators<C> {
 
       g_bold: &self.g_bold[.. generators],
       h_bold: &self.h_bold[.. generators],
+
+      tables: &self.tables,
     })
+  }
+
+  /// Calculate the Pedersen vector commitment `sum(values[i] * g_bold[i]) + mask * h`.
+  ///
+  /// `small[i]` declares `values[i]` to be less than `2**9`, allowing it to be processed faster.
+  ///
+  /// This runs in time independent of the values and mask. Returns `None` if `values` and `small`
+  /// differ in length, there are more values than `g` (bold) generators, or a value declared small
+  /// is not less than `2**9`.
+  pub fn vector_commitment(&self, values: &[C::F], small: &[bool], mask: &C::F) -> Option<C::G>
+  where
+    C::G: ConditionallySelectable,
+  {
+    if (values.len() != small.len()) || (values.len() > self.g_bold.len()) {
+      None?;
+    }
+    // Which flags are set is public, so only the values' bits are accumulated without branching
+    let mut too_large = false;
+    for (value, small) in values.iter().zip(small) {
+      if *small {
+        for bit in value.to_le_bits().iter().skip(ct_fixed_base::SMALL_BITS) {
+          too_large |= *bit;
+        }
+      }
+    }
+    if too_large {
+      None?;
+    }
+    let g_bold = self.tables.bold(Bold::G, &self.g_bold, values.len());
+    let g_h = self.tables.g_h(self.g, self.h);
+    let terms = values.iter().zip(small).enumerate().map(|(i, (value, small))| (value, i, *small));
+    Some(ct_fixed_base::multiexp(
+      terms
+        .clone()
+        .filter(|(_, _, small)| !*small)
+        .map(|(value, i, _)| (value, g_bold.get(i)))
+        .chain(core::iter::once((mask, g_h.get(1)))),
+      terms.filter(|(_, _, small)| *small).map(|(value, i, _)| (value, g_bold.get(i))),
+    ))
   }
 }
 
@@ -288,6 +339,10 @@ impl<C: Ciphersuite> ProofGenerators<'_, C> {
 
   pub(crate) fn h_bold_slice(&self) -> &[C::G] {
     self.h_bold
+  }
+
+  pub(crate) fn tables(&self) -> &Tables<C::G> {
+    self.tables
   }
 }
 

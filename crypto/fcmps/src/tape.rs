@@ -7,7 +7,6 @@ use zeroize::Zeroize;
 
 use generic_array::{typenum::Unsigned as _, GenericArray};
 
-use multiexp::multiexp;
 use ciphersuite::{group::ff::PrimeFieldBits, Ciphersuite};
 
 use ec_divisors::Poly;
@@ -26,6 +25,8 @@ pub(crate) struct VectorCommitmentTape<F: Zeroize + PrimeFieldBits> {
   pub(crate) current_j_offset: usize,
   pub(crate) commitments: Vec<Vec<F>>,
   pub(crate) branch_lengths: Vec<usize>,
+  /// The `(commitment, index)` of every coefficient of a discrete logarithm, each less than 2**8.
+  pub(crate) small: Vec<(usize, usize)>,
 }
 
 impl<F: Zeroize + PrimeFieldBits> VectorCommitmentTape<F> {
@@ -146,6 +147,13 @@ impl<F: Zeroize + PrimeFieldBits> VectorCommitmentTape<F> {
     let mut variables = self.append(witness_a);
     variables.append(&mut self.append(witness_b));
 
+    if dlog.is_some() {
+      for variable in &variables[.. dlog_bits] {
+        let Variable::CG { commitment, index } = variable else { unreachable!() };
+        self.small.push((*commitment, *index));
+      }
+    }
+
     let extra = variables.pop().unwrap();
     let padding = variables.drain(dlog_bits .. 255).collect::<Vec<_>>();
     let dlog = GenericArray::from_slice(&variables).clone();
@@ -242,17 +250,26 @@ impl<F: Zeroize + PrimeFieldBits> VectorCommitmentTape<F> {
   ) -> Vec<C::G> {
     assert_eq!(self.commitments.len(), blinds.len());
 
+    let mut small = vec![vec![]; self.commitments.len()];
+    for (commitment, index) in &self.small {
+      let small = &mut small[*commitment];
+      if small.len() <= *index {
+        small.resize(*index + 1, false);
+      }
+      small[*index] = true;
+    }
+
     let mut res = Vec::with_capacity(self.commitments.len());
-    for (i, (values, blind)) in self.commitments.iter().zip(blinds).enumerate() {
-      let g_generators = generators.g_bold_slice()[.. values.len()].iter().copied();
-      let commitment = g_generators.enumerate().map(|(i, g)| (values[i], g));
-      let mut commitment = if let Some(branch_length) = self.branch_lengths.get(i) {
-        commitment.take(*branch_length).collect::<Vec<_>>()
+    for (i, ((values, blind), mut small)) in
+      self.commitments.iter().zip(blinds).zip(small).enumerate()
+    {
+      let values = if let Some(branch_length) = self.branch_lengths.get(i) {
+        &values[.. (*branch_length).min(values.len())]
       } else {
-        commitment.collect::<Vec<_>>()
+        values
       };
-      commitment.push((*blind, generators.h()));
-      res.push(multiexp(&commitment));
+      small.resize(values.len(), false);
+      res.push(generators.vector_commitment(values, &small, blind).unwrap());
     }
     res
   }

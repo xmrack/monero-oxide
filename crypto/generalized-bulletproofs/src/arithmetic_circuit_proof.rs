@@ -7,7 +7,7 @@ use rand_core::{RngCore, CryptoRng};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 use subtle::ConditionallySelectable;
 
-use multiexp::{multiexp, multiexp_vartime};
+use multiexp::multiexp_vartime;
 use ciphersuite::{
   group::ff::{Field as _, FromUniformBytes},
   Ciphersuite,
@@ -16,6 +16,7 @@ use ciphersuite::{
 use crate::{
   ScalarVector, PointVector, ProofGenerators, PedersenCommitment, PedersenVectorCommitment,
   BatchVerifier,
+  ct_fixed_base::{self, Bold},
   transcript::*,
   lincomb::accumulate_vector,
   inner_product::{IpProveError, IpVerifyError, IpStatement, IpWitness, P},
@@ -339,23 +340,34 @@ where
     let beta = C::F::random(&mut *rng);
     let rho = C::F::random(&mut *rng);
 
-    let AI = {
-      let alg = witness.aL.0.iter().enumerate().map(|(i, aL)| (*aL, self.generators.g_bold(i)));
-      let arh = witness.aR.0.iter().enumerate().map(|(i, aR)| (*aR, self.generators.h_bold(i)));
-      let ah = core::iter::once((alpha, self.generators.h()));
-      let mut AI_terms = alg.chain(arh).chain(ah).collect::<Vec<_>>();
-      let AI = multiexp(&AI_terms);
-      AI_terms.zeroize();
-      AI
-    };
-    let AO = {
-      let aog = witness.aO.0.iter().enumerate().map(|(i, aO)| (*aO, self.generators.g_bold(i)));
-      let bh = core::iter::once((beta, self.generators.h()));
-      let mut AO_terms = aog.chain(bh).collect::<Vec<_>>();
-      let AO = multiexp(&AO_terms);
-      AO_terms.zeroize();
-      AO
-    };
+    let tables = self.generators.tables();
+    let g_bold_tables = tables.bold(Bold::G, self.generators.g_bold_slice(), n);
+    let h_bold_tables = tables.bold(Bold::H, self.generators.h_bold_slice(), n);
+    let g_h_tables = tables.g_h(self.generators.g(), self.generators.h());
+    let g_table = g_h_tables.get(0);
+    let h_table = g_h_tables.get(1);
+
+    let AI = ct_fixed_base::multiexp(
+      witness
+        .aL
+        .0
+        .iter()
+        .enumerate()
+        .map(|(i, aL)| (aL, g_bold_tables.get(i)))
+        .chain(witness.aR.0.iter().enumerate().map(|(i, aR)| (aR, h_bold_tables.get(i))))
+        .chain(core::iter::once((&alpha, h_table))),
+      [],
+    );
+    let AO = ct_fixed_base::multiexp(
+      witness
+        .aO
+        .0
+        .iter()
+        .enumerate()
+        .map(|(i, aO)| (aO, g_bold_tables.get(i)))
+        .chain(core::iter::once((&beta, h_table))),
+      [],
+    );
 
     let mut sL = ScalarVector(Vec::with_capacity(n));
     let mut sR = ScalarVector(Vec::with_capacity(n));
@@ -363,15 +375,15 @@ where
       sL.0.push(C::F::random(&mut *rng));
       sR.0.push(C::F::random(&mut *rng));
     }
-    let S = {
-      let slg = sL.0.iter().enumerate().map(|(i, sL)| (*sL, self.generators.g_bold(i)));
-      let srh = sR.0.iter().enumerate().map(|(i, sR)| (*sR, self.generators.h_bold(i)));
-      let rh = core::iter::once((rho, self.generators.h()));
-      let mut S_terms = slg.chain(srh).chain(rh).collect::<Vec<_>>();
-      let S = multiexp(&S_terms);
-      S_terms.zeroize();
-      S
-    };
+    let S = ct_fixed_base::multiexp(
+      sL.0
+        .iter()
+        .enumerate()
+        .map(|(i, sL)| (sL, g_bold_tables.get(i)))
+        .chain(sR.0.iter().enumerate().map(|(i, sR)| (sR, h_bold_tables.get(i))))
+        .chain(core::iter::once((&rho, h_table))),
+      [],
+    );
 
     transcript.push_point(&AI);
     transcript.push_point(&AO);
@@ -541,10 +553,10 @@ where
     }
     // Calculate commitments to the coefficients of `t`, blinded by `tau`
     for (t, tau) in t.0[(ni / 2) .. ni].iter().zip(tau_before_ni.iter()) {
-      transcript.push_point(&multiexp(&[(*t, self.generators.g()), (*tau, self.generators.h())]));
+      transcript.push_point(&ct_fixed_base::multiexp([(t, g_table), (tau, h_table)], []));
     }
     for (t, tau) in t.0[(ni + 1) ..].iter().zip(tau_after_ni.iter()) {
-      transcript.push_point(&multiexp(&[(*t, self.generators.g()), (*tau, self.generators.h())]));
+      transcript.push_point(&ct_fixed_base::multiexp([(t, g_table), (tau, h_table)], []));
     }
 
     let x: ScalarVector<C::F> = ScalarVector::powers(transcript.challenge::<C>(), t.len());

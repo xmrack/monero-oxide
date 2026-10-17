@@ -6,6 +6,8 @@ use crate::{GeneratorsError, Generators};
 
 #[cfg(test)]
 mod inner_product;
+#[cfg(test)]
+mod ct_fixed_base;
 
 /// Insecurely generate a set of generators for testing purposes.
 ///

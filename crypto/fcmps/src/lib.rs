@@ -578,12 +578,14 @@ where
       current_j_offset: 0,
       commitments: Vec::with_capacity(inputs * layers),
       branch_lengths: Vec::with_capacity(inputs * layers / 2),
+      small: vec![],
     };
     let mut c2_tape = VectorCommitmentTape::<<C::C2 as Ciphersuite>::F> {
       commitment_len: c2_padded_pow_2,
       current_j_offset: 0,
       commitments: Vec::with_capacity(inputs * layers),
       branch_lengths: Vec::with_capacity(inputs * layers / 2),
+      small: vec![],
     };
 
     // This transcripts each input's branches, then the root
@@ -780,6 +782,7 @@ where
       current_j_offset: 0,
       commitments: Vec::with_capacity(inputs.len() * layers),
       branch_lengths: Vec::with_capacity(inputs.len() * layers / 2),
+      small: vec![],
     };
     let mut c1_branches = Vec::with_capacity((layers / 2) + (layers % 2));
     let mut c2_tape = VectorCommitmentTape::<<C::C2 as Ciphersuite>::F> {
@@ -787,6 +790,7 @@ where
       current_j_offset: 0,
       commitments: Vec::with_capacity(inputs.len() * layers),
       branch_lengths: Vec::with_capacity(inputs.len() * layers / 2),
+      small: vec![],
     };
     let mut c2_branches = Vec::with_capacity(layers / 2);
 
