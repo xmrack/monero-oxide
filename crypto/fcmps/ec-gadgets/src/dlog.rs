@@ -2,7 +2,11 @@ use core::{
   fmt,
   ops::{Add, Sub, Div},
 };
-use std_shims::{vec, vec::Vec};
+use std_shims::{
+  vec,
+  vec::Vec,
+  sync::{Arc, Mutex},
+};
 
 use generic_array::typenum::{Sum, Diff, Quot, U1, U2};
 
@@ -325,6 +329,189 @@ pub struct DiscreteLogChallenge<F: PrimeField, Parameters: DiscreteLogParameters
   c2: ChallengePoint<F, Parameters>,
   slope: F,
   intercept: F,
+  template: Option<Arc<DivisorTemplate<F>>>,
+}
+
+// The weight of each divisor coefficient, and the constant
+type Weights<F> = Arc<(Vec<F>, F)>;
+
+/// The constraints `divisor_challenge_eval` adds for `c0, c1, c2`, in terms of the divisor's
+/// coefficients.
+///
+/// Constraint `2i` is `p_d(c_i) - aL`, constraint `2i + 1` is `p_n(c_i) - aO`. As every claim
+/// uses these same six constraints, their weighted sum is calculated once per `z` and scaled by
+/// each claim's `z^(k + 1)`.
+struct DivisorTemplate<F: PrimeField> {
+  // Per challenge point, the coefficient of each divisor coefficient within `p_0_n`, `p_0_d`
+  n: [Vec<F>; 3],
+  d: [Vec<F>; 3],
+  p_1_n: [F; 3],
+  p_1_d: [F; 3],
+  // The constant within `p_0_d`
+  x: [F; 3],
+  weights: Mutex<Option<(F, Weights<F>)>>,
+}
+
+impl<F: PrimeField> DivisorTemplate<F> {
+  fn new<Parameters: DiscreteLogParameters>(cs: [&ChallengePoint<F, Parameters>; 3]) -> Self {
+    let yx_len = Parameters::YxCoefficients::USIZE;
+    let x_len = Parameters::XCoefficientsMinusOne::USIZE;
+    // `y`, `yx`, `x_from_power_of_2`, `zero`
+    let slots = 1 + yx_len + x_len + 1;
+
+    let mut small = Vec::with_capacity(slots + 2);
+    small.push(F::ZERO);
+    for i in 1 .. (slots + 2) {
+      small.push(small[i - 1] + F::ONE);
+    }
+
+    let mut res = DivisorTemplate {
+      n: [vec![], vec![], vec![]],
+      d: [vec![], vec![], vec![]],
+      p_1_n: [F::ZERO; 3],
+      p_1_d: [F::ZERO; 3],
+      x: [F::ZERO; 3],
+      weights: Mutex::new(None),
+    };
+    for (i, c) in cs.into_iter().enumerate() {
+      let mut n = vec![F::ZERO; slots];
+      let mut d = vec![F::ZERO; slots];
+
+      // p_0_n_1
+      n[0] = c.p_0_n_0;
+      n[1 ..= yx_len].copy_from_slice(&c.x_p_0_n_0);
+      // p_0_n_2
+      n[1] += c.y;
+      for j in 1 .. yx_len {
+        n[1 + j] += small[j + 1] * c.yx[j - 1];
+      }
+      for j in 0 .. x_len {
+        n[1 + yx_len + j] = small[j + 2] * c.x[j];
+      }
+
+      // p_0_d
+      d[0] = c.y;
+      d[1 ..= yx_len].copy_from_slice(&c.yx);
+      d[(1 + yx_len) .. (1 + yx_len + x_len)].copy_from_slice(&c.x[1 ..= x_len]);
+      d[slots - 1] = F::ONE;
+
+      res.n[i] = n;
+      res.d[i] = d;
+      res.p_1_n[i] = c.p_1_n;
+      res.p_1_d[i] = c.p_1_d;
+      res.x[i] = c.x[0];
+    }
+    res
+  }
+
+  /// The weight of each divisor coefficient, and the constant, when constraint `r` is weighted by
+  /// `z^r`.
+  fn weights(&self, z: F) -> Weights<F> {
+    let mut cache = self.weights.lock();
+    if let Some((cached_z, weights)) = cache.as_ref() {
+      if *cached_z == z {
+        return weights.clone();
+      }
+    }
+
+    let mut weights = vec![F::ZERO; self.n[0].len()];
+    let mut constant = F::ZERO;
+    let mut z_pow = F::ONE;
+    for i in 0 .. 3 {
+      let z_d = z_pow * self.p_1_d[i];
+      z_pow *= z;
+      let z_n = z_pow * self.p_1_n[i];
+      z_pow *= z;
+      for ((weight, d), n) in weights.iter_mut().zip(&self.d[i]).zip(&self.n[i]) {
+        *weight += (z_d * d) + (z_n * n);
+      }
+      constant += (z_d * self.x[i]) + z_n;
+    }
+
+    let weights = Arc::new((weights, constant));
+    *cache = Some((z, weights.clone()));
+    weights
+  }
+}
+
+/// The six constraints `divisor_challenge_eval` adds for one claim.
+struct DivisorBlock<F: PrimeField> {
+  template: Arc<DivisorTemplate<F>>,
+  first_mul: usize,
+  first_constraint: usize,
+  // The (commitment, index) of each divisor coefficient
+  coefficients: Vec<(usize, usize)>,
+}
+
+impl<F: PrimeField> ConstraintBlock<F> for DivisorBlock<F> {
+  fn accumulate(&self, z: &[F], acc: &mut WeightAcc<'_, F>) {
+    let weights = self.template.weights(z[0]);
+    let z_k = z[self.first_constraint];
+    for ((commitment, index), weight) in self.coefficients.iter().zip(&weights.0) {
+      acc.wcg[*index] += *weight * (z_k * acc.xc[*commitment]);
+    }
+    acc.c += weights.1 * z_k;
+    for i in 0 .. 3 {
+      acc.wl[self.first_mul + i] -= z[self.first_constraint + (2 * i)];
+      acc.wo[self.first_mul + i] -= z[self.first_constraint + (2 * i) + 1];
+    }
+  }
+
+  fn bounds(&self) -> BlockBounds {
+    BlockBounds {
+      a: self
+        .coefficients
+        .iter()
+        .map(|(_, index)| *index)
+        .chain([self.first_mul.saturating_add(2)])
+        .max(),
+      c: self.coefficients.iter().map(|(commitment, _)| *commitment).max(),
+      constraint: Some(self.first_constraint.saturating_add(5)),
+    }
+  }
+}
+
+/// The constraint `aR(m_0) + aR(m_1) + aR(m_2) - sum(weight_j dlog_j) - aR(inverse) = 0`.
+struct DlogBlock<F: PrimeField> {
+  constraint: usize,
+  divisor_muls: usize,
+  inverse: usize,
+  // The (commitment, index) of each element of the discrete logarithm
+  dlog: Vec<(usize, usize)>,
+  weights: Vec<F>,
+}
+
+impl<F: PrimeField> ConstraintBlock<F> for DlogBlock<F> {
+  fn accumulate(&self, z: &[F], acc: &mut WeightAcc<'_, F>) {
+    let z_k = z[self.constraint];
+    for i in 0 .. 3 {
+      acc.wr[self.divisor_muls + i] += z_k;
+    }
+    acc.wr[self.inverse] -= z_k;
+    for ((commitment, index), weight) in self.dlog.iter().zip(&self.weights) {
+      acc.wcg[*index] -= *weight * (z_k * acc.xc[*commitment]);
+    }
+  }
+
+  fn bounds(&self) -> BlockBounds {
+    BlockBounds {
+      a: self
+        .dlog
+        .iter()
+        .map(|(_, index)| *index)
+        .chain([self.divisor_muls.saturating_add(2), self.inverse])
+        .max(),
+      c: self.dlog.iter().map(|(commitment, _)| *commitment).max(),
+      constraint: Some(self.constraint),
+    }
+  }
+}
+
+fn commitment_term(variable: &Variable) -> Option<(usize, usize)> {
+  match variable {
+    Variable::CG { commitment, index } => Some((*commitment, *index)),
+    Variable::aL(_) | Variable::aR(_) | Variable::aO(_) | Variable::V(_) => None,
+  }
 }
 
 /// A generator which has been challenged and is ready for use in evaluating discrete logarithm
@@ -494,7 +681,8 @@ where
       challenged_generators.push(ChallengedGenerator(challenged_generator));
     }
 
-    (DiscreteLogChallenge { c0, c1, c2, slope, intercept }, challenged_generators)
+    let template = self.structured().then(|| Arc::new(DivisorTemplate::new([&c0, &c1, &c2])));
+    (DiscreteLogChallenge { c0, c1, c2, slope, intercept, template }, challenged_generators)
   }
 
   // `DiscreteLog` from `Discrete Log Proof`
@@ -523,6 +711,44 @@ where
     let point = self.on_curve(curve, point);
 
     // The challenge has already been sampled so those lines aren't necessary
+
+    let structured =
+      challenge.template.as_ref().filter(|_| self.structured()).and_then(|template| {
+        let coefficients = [divisor.y]
+          .iter()
+          .chain(&divisor.yx)
+          .chain(&divisor.x_from_power_of_2)
+          .chain([&divisor.zero])
+          .map(commitment_term)
+          .collect::<Option<Vec<_>>>()?;
+        let dlog = dlog.iter().map(commitment_term).collect::<Option<Vec<_>>>()?;
+        Some((template.clone(), coefficients, dlog))
+      });
+    if let Some((template, coefficients, dlog)) = structured {
+      let mut divisor_muls = 0;
+      self.constraint_block(3, 6, |first_mul, first_constraint| {
+        divisor_muls = first_mul;
+        Arc::new(DivisorBlock { template, first_mul, first_constraint, coefficients })
+      });
+
+      let output_interpolation = LinComb::empty()
+        .constant(challenge.intercept)
+        .term(C::F::ONE, point.y)
+        .term(challenge.slope, point.x);
+      let inverse = self.muls();
+      self.inverse(Some(output_interpolation), None);
+
+      self.constraint_block(0, 1, |_, constraint| {
+        Arc::new(DlogBlock {
+          constraint,
+          divisor_muls,
+          inverse,
+          dlog,
+          weights: challenged_generator.0.to_vec(),
+        })
+      });
+      return point;
+    }
 
     // lhs from the paper, evaluating the divisor
     let lhs_eval = LinComb::from(divisor_challenge_eval(self, &divisor, &challenge.c0)) +

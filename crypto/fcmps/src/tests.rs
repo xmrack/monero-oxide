@@ -724,3 +724,154 @@ fn proof_sizes() {
     );
   }
 }
+
+// The structured verifier accumulates the discrete log gadget's constraints without building their
+// `LinComb`s. This builds the same claims both ways and requires every weight to be identical, so a
+// change to either implementation which isn't made to the other fails here.
+fn structured_dlog_matches_lincombs<C: Ciphersuite, E: Ciphersuite, P: DiscreteLogParameters>()
+where
+  C::F: ciphersuite::group::ff::FromUniformBytes<64>,
+  E::G: ec_divisors::DivisorCurve<FieldElement = C::F>,
+{
+  use generic_array::{GenericArray, typenum::Unsigned as _};
+  use ciphersuite::group::Group as _;
+  use ec_divisors::DivisorCurve as _;
+  use generalized_bulletproofs::transcript::Transcript as ProverTranscript;
+  use generalized_bulletproofs_circuit_abstraction::{Circuit as Raw, Variable, WeightAcc};
+  use generalized_bulletproofs_ec_gadgets::{
+    CurveSpec, EcDlogGadgets as _, GeneratorTable, PointWithDlog, Divisor,
+  };
+
+  const CLAIMS: usize = 3;
+  const N: usize = 1024;
+
+  let curve = CurveSpec { a: E::G::a(), b: E::G::b() };
+  let tables = (0 .. 2)
+    .map(|_| {
+      let (x, y) = E::G::to_xy(E::G::random(&mut OsRng)).unwrap();
+      GeneratorTable::<C::F, P>::new(&curve, x, y)
+    })
+    .collect::<Vec<_>>();
+
+  let build = |mut circuit: Raw<C>, padding: usize| {
+    // Multiplications before the claims, so their indexes may exceed those of the commitments
+    for _ in 0 .. padding {
+      circuit.mul(None, None, None);
+    }
+    let mut transcript = ProverTranscript::new([7; 32]);
+    let (challenge, challenged) =
+      circuit.discrete_log_challenge::<_, P>(&mut transcript, &curve, &[&tables[0], &tables[1]]);
+    // Commitments 0 and 2 hold the points and discrete logs, commitment 1 the divisors
+    let mut next = [0usize; 3];
+    let mut fresh = |commitment: usize| {
+      let index = next[commitment];
+      next[commitment] += 1;
+      Variable::CG { commitment, index }
+    };
+    for claim in 0 .. CLAIMS {
+      let holder = if claim == (CLAIMS - 1) { 2 } else { 0 };
+      let point = (fresh(holder), fresh(holder));
+      let dlog =
+        GenericArray::try_from_iter((0 .. P::ScalarBits::USIZE).map(|_| fresh(holder))).unwrap();
+      let divisor = Divisor::<P> {
+        y: fresh(1),
+        yx: GenericArray::try_from_iter((0 .. P::YxCoefficients::USIZE).map(|_| fresh(1))).unwrap(),
+        x_from_power_of_2: GenericArray::try_from_iter(
+          (0 .. P::XCoefficientsMinusOne::USIZE).map(|_| fresh(1)),
+        )
+        .unwrap(),
+        zero: fresh(1),
+      };
+      circuit.discrete_log::<P>(
+        &curve,
+        PointWithDlog { point, dlog, divisor },
+        &challenge,
+        &challenged[claim % 2],
+      );
+    }
+    circuit
+  };
+  for padding in [0, N - 64] {
+    let structured = build(Raw::<C>::verify(), padding);
+    let reference = build(Raw::<C>::verify_unstructured(), padding);
+
+    assert_eq!(structured.blocks().len(), 2 * CLAIMS, "the structured path was not taken");
+    assert!(reference.blocks().is_empty());
+    assert_eq!(structured.muls(), reference.muls());
+    assert_eq!(structured.constraints().len(), reference.constraints().len());
+
+    // Each block only touches what its bounds declare, which `new_with_blocks` checks
+    for block in structured.blocks() {
+      let bounds = block.bounds();
+      let (a, c, constraints) =
+        (bounds.a.unwrap() + 1, bounds.c.unwrap() + 1, bounds.constraint.unwrap() + 1);
+      let random = |len: usize| {
+        (0 .. len)
+          .map(|_| <C::F as ciphersuite::group::ff::Field>::random(&mut OsRng))
+          .collect::<Vec<_>>()
+      };
+      let (z, xc) = (random(constraints), random(c));
+      let (mut wl, mut wr, mut wo, mut wcg) =
+        (vec![C::F::ZERO; a], vec![C::F::ZERO; a], vec![C::F::ZERO; a], vec![C::F::ZERO; a]);
+      let mut acc =
+        WeightAcc { wl: &mut wl, wr: &mut wr, wo: &mut wo, wcg: &mut wcg, xc: &xc, c: C::F::ZERO };
+      block.accumulate(&z, &mut acc);
+    }
+
+    let weights = |circuit: &Raw<C>, z: &[C::F], xc: &[C::F]| {
+      let mut wl = vec![C::F::ZERO; N];
+      let mut wr = vec![C::F::ZERO; N];
+      let mut wo = vec![C::F::ZERO; N];
+      let mut wcg = vec![C::F::ZERO; N];
+      let mut c = C::F::ZERO;
+      for (constraint, z) in circuit.constraints().iter().zip(z) {
+        for (i, weight) in constraint.WL() {
+          wl[*i] += *weight * z;
+        }
+        for (i, weight) in constraint.WR() {
+          wr[*i] += *weight * z;
+        }
+        for (i, weight) in constraint.WO() {
+          wo[*i] += *weight * z;
+        }
+        for (i, weights) in constraint.WCG() {
+          for (j, weight) in weights {
+            wcg[*j] += *weight * *z * xc[*i];
+          }
+        }
+        c += constraint.c() * z;
+      }
+      let mut acc =
+        WeightAcc { wl: &mut wl, wr: &mut wr, wo: &mut wo, wcg: &mut wcg, xc, c: C::F::ZERO };
+      for block in circuit.blocks() {
+        block.accumulate(z, &mut acc);
+      }
+      c += acc.c;
+      (wl, wr, wo, wcg, c)
+    };
+
+    for _ in 0 .. 3 {
+      let z_1 = <C::F as ciphersuite::group::ff::Field>::random(&mut OsRng);
+      let mut z = vec![z_1];
+      while z.len() < reference.constraints().len() {
+        z.push(*z.last().unwrap() * z_1);
+      }
+      let xc = [
+        <C::F as ciphersuite::group::ff::Field>::random(&mut OsRng),
+        <C::F as ciphersuite::group::ff::Field>::random(&mut OsRng),
+        <C::F as ciphersuite::group::ff::Field>::random(&mut OsRng),
+      ];
+      assert!(
+        weights(&structured, &z, &xc) == weights(&reference, &z, &xc),
+        "the structured weights differ from the LinComb weights"
+      );
+    }
+  }
+}
+
+#[test]
+fn test_structured_dlog_matches_lincombs() {
+  structured_dlog_matches_lincombs::<Selene, Ed25519, Ed25519Params>();
+  structured_dlog_matches_lincombs::<Helios, Selene, SeleneParams>();
+  structured_dlog_matches_lincombs::<Selene, Helios, HeliosParams>();
+}

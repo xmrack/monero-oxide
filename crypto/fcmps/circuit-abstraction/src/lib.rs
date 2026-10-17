@@ -4,7 +4,8 @@
 #![deny(missing_docs)]
 #![allow(non_snake_case)]
 
-use std_shims::{vec, vec::Vec};
+use core::fmt;
+use std_shims::{vec, vec::Vec, sync::Arc};
 
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -20,7 +21,9 @@ use generalized_bulletproofs::{
     AcStatementError, ArithmeticCircuitStatement, ArithmeticCircuitWitness,
   },
 };
-pub use generalized_bulletproofs::arithmetic_circuit_proof::{Variable, LinComb};
+pub use generalized_bulletproofs::arithmetic_circuit_proof::{
+  Variable, LinComb, ConstraintBlock, BlockBounds, WeightAcc,
+};
 
 mod gadgets;
 
@@ -80,6 +83,25 @@ pub struct Circuit<C: Ciphersuite> {
   // A series of linear combinations which must evaluate to 0.
   constraints: Vec<LinComb<C::F>>,
   prover: Option<ProverData<C>>,
+  blocks: BlockList<C>,
+}
+
+#[derive(Clone)]
+struct BlockList<C: Ciphersuite>(Option<Vec<Arc<dyn ConstraintBlock<C::F>>>>);
+impl<C: Ciphersuite> PartialEq for BlockList<C> {
+  fn eq(&self, other: &Self) -> bool {
+    match (&self.0, &other.0) {
+      (Some(a), Some(b)) => (a.len() == b.len()) && a.iter().zip(b).all(|(a, b)| Arc::ptr_eq(a, b)),
+      (None, None) => true,
+      (Some(_), None) | (None, Some(_)) => false,
+    }
+  }
+}
+impl<C: Ciphersuite> Eq for BlockList<C> {}
+impl<C: Ciphersuite> fmt::Debug for BlockList<C> {
+  fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fmt.debug_struct("BlockList").field("len", &self.0.as_ref().map(Vec::len)).finish()
+  }
 }
 
 impl<C: Ciphersuite> Circuit<C> {
@@ -98,12 +120,56 @@ impl<C: Ciphersuite> Circuit<C> {
       muls: 0,
       constraints: vec![],
       prover: Some(ProverData { aL: vec![], aR: vec![], C: vector_commitments, V: commitments }),
+      blocks: BlockList(None),
     }
   }
 
   /// Create an instance to verify a proof with.
   pub fn verify() -> Self {
-    Self { muls: 0, constraints: vec![], prover: None }
+    Self { muls: 0, constraints: vec![], prover: None, blocks: BlockList(Some(vec![])) }
+  }
+
+  /// Create an instance to verify a proof with which builds every constraint as a `LinComb`.
+  ///
+  /// This is the reference the structured verifier is checked against.
+  #[doc(hidden)]
+  pub fn verify_unstructured() -> Self {
+    Self { muls: 0, constraints: vec![], prover: None, blocks: BlockList(None) }
+  }
+
+  /// The constraints which were built as `LinComb`s.
+  #[doc(hidden)]
+  pub fn constraints(&self) -> &[LinComb<C::F>] {
+    &self.constraints
+  }
+
+  /// The `ConstraintBlock`s which were added.
+  #[doc(hidden)]
+  pub fn blocks(&self) -> &[Arc<dyn ConstraintBlock<C::F>>] {
+    self.blocks.0.as_deref().unwrap_or(&[])
+  }
+
+  /// Whether this circuit accepts `ConstraintBlock`s.
+  pub fn structured(&self) -> bool {
+    self.blocks.0.is_some()
+  }
+
+  /// Add a `ConstraintBlock` over `muls` new multiplications and `constraints` new constraints.
+  ///
+  /// `block` is called with the index of the first multiplication and of the first constraint.
+  /// Returns false, without changing the circuit, if this circuit doesn't accept blocks.
+  pub fn constraint_block(
+    &mut self,
+    muls: usize,
+    constraints: usize,
+    block: impl FnOnce(usize, usize) -> Arc<dyn ConstraintBlock<C::F>>,
+  ) -> bool {
+    let Some(blocks) = self.blocks.0.as_mut() else { return false };
+    let block = block(self.muls, self.constraints.len());
+    blocks.push(block);
+    self.muls += muls;
+    self.constraints.resize(self.constraints.len() + constraints, LinComb::empty());
+    true
   }
 
   /// Evaluate a linear combination.
@@ -196,7 +262,15 @@ where
     (ArithmeticCircuitStatement<'_, C>, Option<ArithmeticCircuitWitness<C>>),
     AcStatementError,
   > {
-    let statement = ArithmeticCircuitStatement::new(generators, self.constraints, commitments)?;
+    let statement = match self.blocks.0 {
+      Some(blocks) => ArithmeticCircuitStatement::new_with_blocks(
+        generators,
+        self.constraints,
+        blocks,
+        commitments,
+      )?,
+      None => ArithmeticCircuitStatement::new(generators, self.constraints, commitments)?,
+    };
 
     let witness = self.prover.and_then(|mut prover| {
       // We can't deconstruct the witness as it implements Drop (per ZeroizeOnDrop)

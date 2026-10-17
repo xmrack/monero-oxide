@@ -1,6 +1,7 @@
 #![allow(clippy::many_single_char_names)]
 
-use std_shims::{vec, vec::Vec};
+use core::fmt;
+use std_shims::{vec, vec::Vec, sync::Arc};
 
 use rand_core::{RngCore, CryptoRng};
 
@@ -9,7 +10,7 @@ use subtle::ConditionallySelectable;
 
 use multiexp::{multiexp, multiexp_vartime};
 use ciphersuite::{
-  group::ff::{Field as _, FromUniformBytes},
+  group::ff::{Field as _, PrimeField, FromUniformBytes, BatchInvert as _},
   Ciphersuite,
 };
 
@@ -18,7 +19,7 @@ use crate::{
   BatchVerifier,
   transcript::*,
   lincomb::accumulate_vector,
-  inner_product::{IpProveError, IpVerifyError, IpStatement, IpWitness, P},
+  inner_product::{IpProveError, IpStatement, IpWitness, P},
 };
 pub use crate::lincomb::{Variable, LinComb};
 
@@ -39,6 +40,53 @@ pub struct ArithmeticCircuitStatement<'a, C: Ciphersuite> {
   constraints: Vec<LinComb<C::F>>,
   C: PointVector<C>,
   V: PointVector<C>,
+  blocks: Blocks<C::F>,
+}
+
+/// The z-weighted sums of the constraints, as the verifier uses them.
+pub struct WeightAcc<'a, F> {
+  /// `sum_k z_k WL_k`
+  pub wl: &'a mut [F],
+  /// `sum_k z_k WR_k`
+  pub wr: &'a mut [F],
+  /// `sum_k z_k WO_k`
+  pub wo: &'a mut [F],
+  /// `sum_i xc_i sum_k z_k WCG_{k, i}`
+  pub wcg: &'a mut [F],
+  /// The weight of each vector commitment's terms within `wcg`
+  pub xc: &'a [F],
+  /// `sum_k z_k c_k`
+  pub c: F,
+}
+
+/// The highest indexes a `ConstraintBlock` uses.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct BlockBounds {
+  /// The highest index into `aL`, `aR`, `aO`, or the terms of a vector commitment.
+  pub a: Option<usize>,
+  /// The highest vector commitment.
+  pub c: Option<usize>,
+  /// The highest constraint.
+  pub constraint: Option<usize>,
+}
+
+/// Constraints whose z-weighted sum is accumulated directly, instead of from `LinComb`s.
+///
+/// The constraints a block covers MUST be present in the statement's constraints as empty
+/// `LinComb`s, so the numbering of the constraints, and therefore their weights, is unchanged.
+pub trait ConstraintBlock<F: PrimeField>: Send + Sync {
+  /// Add this block's constraints, constraint `k` being weighted by `z[k] = z[0]^(k + 1)`.
+  fn accumulate(&self, z: &[F], acc: &mut WeightAcc<'_, F>);
+  /// The highest indexes used.
+  fn bounds(&self) -> BlockBounds;
+}
+
+#[derive(Clone)]
+struct Blocks<F: PrimeField>(Vec<Arc<dyn ConstraintBlock<F>>>);
+impl<F: PrimeField> fmt::Debug for Blocks<F> {
+  fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fmt.debug_struct("Blocks").field("len", &self.0.len()).finish()
+  }
 }
 
 impl<C: Ciphersuite> Zeroize for ArithmeticCircuitStatement<'_, C> {
@@ -165,7 +213,32 @@ where
       Err(AcStatementError::TooManyCommitments)?;
     }
 
-    Ok(Self { generators, constraints, C, V })
+    Ok(Self { generators, constraints, C, V, blocks: Blocks(vec![]) })
+  }
+
+  /// `new`, with constraints accumulated by `ConstraintBlock`s when verifying.
+  ///
+  /// Proving a statement with blocks is not supported.
+  pub fn new_with_blocks(
+    generators: ProofGenerators<'a, C>,
+    constraints: Vec<LinComb<C::F>>,
+    blocks: Vec<Arc<dyn ConstraintBlock<C::F>>>,
+    commitments: Commitments<C>,
+  ) -> Result<Self, AcStatementError> {
+    let mut res = Self::new(generators, constraints, commitments)?;
+    for block in &blocks {
+      let bounds = block.bounds();
+      if (Some(res.generators.len()) <= bounds.a) ||
+        (Some(res.constraints.len()) <= bounds.constraint)
+      {
+        Err(AcStatementError::ConstrainedNonExistentTerm)?;
+      }
+      if Some(res.C.len()) <= bounds.c {
+        Err(AcStatementError::ConstrainedNonExistentVectorCommitment)?;
+      }
+    }
+    res.blocks = Blocks(blocks);
+    Ok(res)
   }
 
   /// The amount of rows within the resulting inner-product argument.
@@ -693,129 +766,156 @@ where
     for _ in (ni + 1) .. t_poly_len {
       T_after_ni.push(transcript.read_point::<C>().map_err(|_| AcVerifyError::IncompleteProof)?);
     }
-    let x: ScalarVector<C::F> = ScalarVector::powers(transcript.challenge::<C>(), t_poly_len);
-
-    let mut l_weights = ScalarVector::new(n);
-    let mut r_weights = ScalarVector::new(n);
-    let mut o_weights = ScalarVector::new(n);
-    for (constraint, z) in self.constraints.iter().zip(&z.0) {
-      accumulate_vector(&mut l_weights, &constraint.WL, *z);
-      accumulate_vector(&mut r_weights, &constraint.WR, *z);
-      accumulate_vector(&mut o_weights, &constraint.WO, *z);
-    }
-    let r_weights = r_weights * &y_inv;
-
-    let delta = r_weights.inner_product(l_weights.0.iter());
+    let x_unweighted: ScalarVector<C::F> =
+      ScalarVector::powers(transcript.challenge::<C>(), t_poly_len);
 
     let tau_x = transcript.read_scalar::<C>().map_err(|_| AcVerifyError::IncompleteProof)?;
     let mu = transcript.read_scalar::<C>().map_err(|_| AcVerifyError::IncompleteProof)?;
     let t_caret = transcript.read_scalar::<C>().map_err(|_| AcVerifyError::IncompleteProof)?;
 
-    // Lines 88-90, modified per Generalized Bulletproofs as needed w.r.t. `t`
-    // This corresponds to the verifier's final Step 4 in the 'fixed' paper
-    {
-      let verifier_weight = C::F::random(&mut *rng);
-      // lhs of the equation, weighted to enable batch verification
-      verifier.g += t_caret * verifier_weight;
-      verifier.h += tau_x * verifier_weight;
+    // The weights for the verifier's final Step 4, and Steps 3 and 5, in the 'fixed' paper
+    let t_weight = C::F::random(&mut *rng);
+    let verifier_weight = C::F::random(&mut *rng);
+    // Multiply `x` by `verifier_weight` as this effects `verifier_weight` onto most scalars and
+    // saves a notable amount of operations
+    let x = x_unweighted.clone() * verifier_weight;
 
-      // rhs of the equation, negated to cause a sum to zero
+    // The z-weighted sums of the constraints, in one pass
+    let mut wl = vec![C::F::ZERO; n];
+    let mut wr = vec![C::F::ZERO; n];
+    let mut wo = vec![C::F::ZERO; n];
+    let mut wcg = vec![C::F::ZERO; n];
+    let mut wv = vec![C::F::ZERO; self.V.len()];
+    // The terms for `C` increment from `1`
+    let xc: Vec<C::F> = (0 .. c).map(|i| x[1 + i]).collect();
+    let mut zc = C::F::ZERO;
+    // `new` bounds every index by the length of the vector it indexes
+    for (constraint, z) in self.constraints.iter().zip(&z.0) {
+      for (i, weight) in &constraint.WL {
+        wl[*i] += *weight * z;
+      }
+      for (i, weight) in &constraint.WR {
+        wr[*i] += *weight * z;
+      }
+      for (i, weight) in &constraint.WO {
+        wo[*i] += *weight * z;
+      }
+      for (i, WCG) in constraint.WCG() {
+        let factor = *z * xc[*i];
+        for (j, weight) in WCG {
+          wcg[*j] += *weight * factor;
+        }
+      }
+      for (i, weight) in &constraint.WV {
+        wv[*i] += *weight * z;
+      }
+      zc += constraint.c * z;
+    }
+    {
+      let mut acc =
+        WeightAcc { wl: &mut wl, wr: &mut wr, wo: &mut wo, wcg: &mut wcg, xc: &xc, c: C::F::ZERO };
+      for block in &self.blocks.0 {
+        block.accumulate(&z.0, &mut acc);
+      }
+      zc += acc.c;
+    }
+
+    // `WR y^{-n}` and `delta = <WR y^{-n}, WL>`
+    let mut delta = C::F::ZERO;
+    for ((wr, wl), y_inv) in wr.iter_mut().zip(&wl).zip(&y_inv.0) {
+      *wr *= y_inv;
+      delta += *wr * wl;
+    }
+
+    // Lines 88-90, modified per Generalized Bulletproofs as needed w.r.t. `t`
+    {
+      // lhs of the equation, weighted to enable batch verification
+      verifier.g += t_caret * t_weight;
+      verifier.h += tau_x * t_weight;
 
       /*
         `delta - z...`, instead of `delta + z...`, is because we write our constraint as
         `+ c = 0`, not `= c`, so we have to subtract it from both sides, which this effects.
       */
-      verifier.g -= verifier_weight *
-        x[ni] *
-        (delta - z.inner_product(self.constraints.iter().map(|constraint| &constraint.c)));
-      let mut V_weights = ScalarVector::new(self.V.len());
-      for (constraint, z) in self.constraints.iter().zip(&z.0) {
-        accumulate_vector(&mut V_weights, &constraint.WV, *z);
-      }
-      V_weights = V_weights * x[ni];
-      for pair in V_weights.0.into_iter().zip(self.V.0) {
-        /*
-          We actually don't negate `verifier_weight` here as we write our constraint as
-          `... + WV V = 0` not `= WV V + ..`. This means we need to subtract it from both sides,
-          which this effects.
-        */
-        verifier.additional.push((verifier_weight * pair.0, pair.1));
+      verifier.g -= t_weight * x_unweighted[ni] * (delta - zc);
+      for (weight, V) in wv.iter().zip(&self.V.0) {
+        // Not negated as we write our constraint as `... + WV V = 0`
+        verifier.additional.push((t_weight * (*weight * x_unweighted[ni]), *V));
       }
       for (i, T) in T_before_ni.into_iter().enumerate() {
-        verifier.additional.push((-verifier_weight * x[(ni / 2) + i], T));
+        verifier.additional.push((-t_weight * x_unweighted[(ni / 2) + i], T));
       }
       for (i, T) in T_after_ni.into_iter().enumerate() {
-        verifier.additional.push((-verifier_weight * x[ni + 1 + i], T));
+        verifier.additional.push((-t_weight * x_unweighted[ni + 1 + i], T));
       }
     }
 
-    // This corresponds to the verifier's final Steps 3, 5 in the 'fixed' paper
-
-    let verifier_weight = C::F::random(&mut *rng);
-    // Multiply `x` by `verifier_weight` as this effects `verifier_weight` onto most scalars and
-    // saves a notable amount of operations
-    let x = x * verifier_weight;
-
-    // This following block effectively calculates P, within the multiexp
-    {
-      verifier.additional.push((x[ilr], AI));
-      verifier.additional.push((x[io], AO));
-      // `h_bold' * y` is equivalent to `h_bold` as `h_bold'` _is_ `h_bold * y^{-1}`
-      let mut log2_n = 0;
-      while (1 << log2_n) != n {
-        log2_n += 1;
-      }
-      verifier.h_sum[log2_n] -= verifier_weight;
-      verifier.additional.push((x[is], S));
-
-      // Lines 85-87 calculate `WL`, `WR`, `WO`
-      // We preserve them in terms of `g_bold` and `h_bold` for a more efficient multiexp
-      let mut h_bold_scalars = l_weights * x[ilr];
-      for (i, wr) in (r_weights * x[ilr]).0.into_iter().enumerate() {
-        verifier.g_bold[i] += wr;
-      }
-      h_bold_scalars = h_bold_scalars + &(o_weights * x[jo]);
-
-      for i in 0 .. self.C.len() {
-        let mut cg = ScalarVector::new(n);
-        for (constraint, z) in self.constraints.iter().zip(&z.0) {
-          if let Some(WCG) = constraint.WCG().get(&i) {
-            accumulate_vector(&mut cg, WCG, *z);
-          }
-        }
-
-        // Push the terms for `C`, which increment from `0`, and the terms for `WC`, which
-        // decrement from `n'`
-        {
-          let C = self.C.0[i];
-          let WCG = cg;
-          let i = 1 + i;
-          let j = ni - i;
-          verifier.additional.push((x[j], C));
-          h_bold_scalars = h_bold_scalars + &(WCG * x[i]);
-        }
-      }
-
-      // All terms for `h_bold` here have actually been for `h_bold'`, `h_bold * y^{-1}`
-      h_bold_scalars = h_bold_scalars * &y_inv;
-      for (i, scalar) in h_bold_scalars.0.into_iter().enumerate() {
-        verifier.h_bold[i] += scalar;
-      }
-
-      // Remove `mu * h` from `P`
-      verifier.h -= verifier_weight * mu;
+    // P, within the multiexp
+    verifier.additional.push((x[ilr], AI));
+    verifier.additional.push((x[io], AO));
+    // `h_bold' * y` is equivalent to `h_bold` as `h_bold'` _is_ `h_bold * y^{-1}`
+    let mut log2_n = 0;
+    while (1 << log2_n) != n {
+      log2_n += 1;
     }
+    verifier.h_sum[log2_n] -= verifier_weight;
+    verifier.additional.push((x[is], S));
+    // The terms for `C` increment from `1`, the terms for `WC` decrement from `n'`
+    for (i, C) in self.C.0.iter().enumerate() {
+      verifier.additional.push((x[ni - (1 + i)], *C));
+    }
+    // Remove `mu * h` from `P`
+    verifier.h -= verifier_weight * mu;
 
     // Prove for lines 88, 92 with an Inner-Product statement
-    // This inlines Protocol 1, as our IpStatement implements Protocol 2
+    // This inlines Protocol 1, and Protocol 2 for the verifier
     let ip_x = transcript.challenge::<C>();
     // `P` is amended with this additional term
     verifier.g += verifier_weight * ip_x * t_caret;
-    IpStatement::new(self.generators, y_inv, ip_x, P::Verifier { verifier_weight })
-      .expect("created an invalid IpStatement")
-      .verify(verifier, transcript)
-      .map_err(|e| match e {
-        IpVerifyError::IncompleteProof => AcVerifyError::IncompleteProof,
-      })
+
+    let mut lr_len = 0;
+    while (1 << lr_len) < n {
+      lr_len += 1;
+    }
+    let mut L = Vec::with_capacity(lr_len);
+    let mut R = Vec::with_capacity(lr_len);
+    let mut xs: Vec<C::F> = Vec::with_capacity(lr_len);
+    for _ in 0 .. lr_len {
+      L.push(transcript.read_point::<C>().map_err(|_| AcVerifyError::IncompleteProof)?);
+      R.push(transcript.read_point::<C>().map_err(|_| AcVerifyError::IncompleteProof)?);
+      let x = transcript.challenge::<C>();
+      assert!(!bool::from(x.is_zero()), "transcript challenge was 0");
+      xs.push(x);
+    }
+    let mut x_invs = xs.clone();
+    (&mut x_invs).batch_invert();
+    let mut challenges = Vec::with_capacity(lr_len);
+    verifier.additional.reserve(2 * lr_len);
+    for ((x, x_inv), (L, R)) in xs.into_iter().zip(x_invs).zip(L.into_iter().zip(R)) {
+      challenges.push((x, x_inv));
+      verifier.additional.push((verifier_weight * x.square(), L));
+      verifier.additional.push((verifier_weight * x_inv.square(), R));
+    }
+    let product_cache = IpStatement::<C>::challenge_products(&challenges);
+
+    let a = transcript.read_scalar::<C>().map_err(|_| AcVerifyError::IncompleteProof)?;
+    let b = transcript.read_scalar::<C>().map_err(|_| AcVerifyError::IncompleteProof)?;
+
+    // `g_bold`: the circuit's `WR y^{-n} x_ilr`, the IPA's `-a s_i`
+    // `h_bold`: the circuit's `(WL x_ilr + WO x_jo + WCG x) y^{-n}`,
+    //   the IPA's `-b s_{n - 1 - i} y^{-i}`
+    let weighted_a = verifier_weight * a;
+    let weighted_b = verifier_weight * b;
+    let (x_ilr, x_jo) = (x[ilr], x[jo]);
+    for (i, ((g_bold, h_bold), y_inv)) in
+      verifier.g_bold.iter_mut().zip(verifier.h_bold.iter_mut()).zip(&y_inv.0).take(n).enumerate()
+    {
+      *g_bold += (wr[i] * x_ilr) - (weighted_a * product_cache[i]);
+      *h_bold += *y_inv *
+        (((wl[i] * x_ilr) + (wo[i] * x_jo) + wcg[i]) - (weighted_b * product_cache[n - 1 - i]));
+    }
+    verifier.g -= verifier_weight * (a * b) * ip_x;
+
+    Ok(())
   }
 }

@@ -4,15 +4,23 @@ use subtle::ConditionallySelectable;
 
 use multiexp::multiexp_vartime;
 use ciphersuite::{
-  group::ff::{Field as _, FromUniformBytes, BatchInvert as _},
+  group::ff::{Field as _, FromUniformBytes},
   Ciphersuite,
 };
 
-use crate::{ScalarVector, PointVector, ProofGenerators, BatchVerifier, transcript::*};
+#[cfg(test)]
+use ciphersuite::group::ff::BatchInvert as _;
+
+#[cfg(test)]
+use crate::BatchVerifier;
+use crate::{ScalarVector, PointVector, ProofGenerators, transcript::*};
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) enum P<C: Ciphersuite> {
-  Verifier { verifier_weight: C::F },
+  #[cfg_attr(not(test), allow(dead_code))]
+  Verifier {
+    verifier_weight: C::F,
+  },
   Prover(C::G),
 }
 
@@ -251,6 +259,7 @@ where
 }
 
 /// An error from verifying Inner-Product statements.
+#[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum IpVerifyError {
   /// The proof wasn't complete and the necessary values could not be read from the transcript.
@@ -280,7 +289,7 @@ where
   When there are 4 challenges (n=16), the iterative approach does 28 multiplications
   versus divide and conquer's 24.
   */
-  fn challenge_products(challenges: &[(C::F, C::F)]) -> Vec<C::F> {
+  pub(crate) fn challenge_products(challenges: &[(C::F, C::F)]) -> Vec<C::F> {
     let mut products = vec![C::F::ONE; 1 << challenges.len()];
 
     if !challenges.is_empty() {
@@ -313,6 +322,7 @@ where
   /// order to ensure the proof is actually correct.
   ///
   /// If this proof returns `Err(_)`, the BatchVerifier MUST be assumed corrupted and discarded.
+  #[cfg(test)]
   pub(crate) fn verify(
     self,
     verifier: &mut BatchVerifier<C>,
