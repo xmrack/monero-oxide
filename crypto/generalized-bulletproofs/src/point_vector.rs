@@ -5,6 +5,7 @@ use zeroize::Zeroize;
 
 use ciphersuite::Ciphersuite;
 
+#[cfg(test)]
 use crate::ScalarVector;
 
 /// A point vector struct with the functionality necessary for Bulletproofs.
@@ -82,6 +83,7 @@ impl<C: Ciphersuite> PointVector<C> {
   /// Scales the points in this vector by the corresponding scalars within the scalar vector.
   ///
   /// May panic if the vectors are different lengths.
+  #[cfg(test)]
   pub(crate) fn mul_vec(mut self, vector: &ScalarVector<C::F>) -> Self {
     debug_assert_eq!(
       self.len(),
@@ -116,15 +118,5 @@ impl<C: Ciphersuite> PointVector<C> {
 
   pub(crate) fn len(&self) -> usize {
     self.0.len()
-  }
-
-  /// Split this point vector into two equally-sized parts.
-  ///
-  /// May panic if `self.len()` is not a power of two at least `2^1`.
-  pub(crate) fn split(mut self) -> (Self, Self) {
-    debug_assert!(self.len() > 1);
-    let r = self.0.split_off(self.len() / 2);
-    debug_assert_eq!(self.len(), r.len());
-    (self, PointVector(r))
   }
 }

@@ -7,7 +7,7 @@ use rand_core::{RngCore, CryptoRng};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 use subtle::ConditionallySelectable;
 
-use multiexp::{multiexp, multiexp_vartime};
+use multiexp::multiexp;
 use ciphersuite::{
   group::ff::{Field as _, FromUniformBytes},
   Ciphersuite,
@@ -610,27 +610,13 @@ where
 
     let ip_x = transcript.challenge::<C>();
 
-    let mut P_terms = Vec::with_capacity(1 + (2 * self.generators.len()));
-    debug_assert_eq!(l.len(), r.len());
-    for (i, (l, r)) in l.0.iter().zip(r.0.iter()).enumerate() {
-      P_terms.push((*l, self.generators.g_bold(i)));
-      P_terms.push((y_inv[i] * r, self.generators.h_bold(i)));
-    }
-
-    P_terms.push((ip_x * t_caret, self.generators.g()));
-    IpStatement::new(
-      self.generators,
-      y_inv,
-      ip_x,
-      // Safe since IpStatement isn't a ZK proof
-      P::Prover(multiexp_vartime(&P_terms)),
-    )
-    .expect("created an invalid IpStatement")
-    .prove(transcript, IpWitness::new(l, r).expect("created an invalid IpWitness"))
-    .map_err(|e| match e {
-      IpProveError::IncorrectAmountOfGenerators => AcProveError::IncorrectAmountOfGenerators,
-      IpProveError::InconsistentWitness => AcProveError::InconsistentWitness,
-    })
+    IpStatement::new(self.generators, y_inv, ip_x, P::Prover)
+      .expect("created an invalid IpStatement")
+      .prove(transcript, IpWitness::new(l, r).expect("created an invalid IpWitness"))
+      .map_err(|e| match e {
+        IpProveError::IncorrectAmountOfGenerators => AcProveError::IncorrectAmountOfGenerators,
+        IpProveError::InconsistentWitness => AcProveError::InconsistentWitness,
+      })
   }
 }
 

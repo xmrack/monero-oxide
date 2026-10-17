@@ -4,16 +4,19 @@ use subtle::ConditionallySelectable;
 
 use multiexp::multiexp_vartime;
 use ciphersuite::{
-  group::ff::{Field as _, FromUniformBytes, BatchInvert as _},
+  group::{
+    ff::{Field as _, PrimeFieldBits, FromUniformBytes, BatchInvert as _},
+    Group,
+  },
   Ciphersuite,
 };
 
-use crate::{ScalarVector, PointVector, ProofGenerators, BatchVerifier, transcript::*};
+use crate::{ScalarVector, ProofGenerators, BatchVerifier, transcript::*};
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) enum P<C: Ciphersuite> {
   Verifier { verifier_weight: C::F },
-  Prover(C::G),
+  Prover,
 }
 
 /// The Bulletproofs Inner-Product statement.
@@ -101,6 +104,56 @@ pub(crate) enum IpProveError {
   InconsistentWitness,
 }
 
+/// The non-adjacent form of a scalar, with digits odd and less than `2**(WINDOW - 1)` in magnitude.
+pub(crate) fn wnaf<F: PrimeFieldBits>(scalar: &F) -> Vec<i8> {
+  const WINDOW: usize = 5;
+  let bits = scalar.to_le_bits();
+  let bit = |i: usize| (i < bits.len()) && bits[i];
+  let mut naf = vec![0; bits.len() + 1];
+  let mut carry = 0;
+  let mut i = 0;
+  while i < naf.len() {
+    if u8::from(bit(i)) == carry {
+      i += 1;
+      continue;
+    }
+    let mut window = carry;
+    for b in 0 .. WINDOW {
+      window += u8::from(bit(i + b)) << b;
+    }
+    let digit = i8::try_from(window).unwrap();
+    if window < (1 << (WINDOW - 1)) {
+      naf[i] = digit;
+      carry = 0;
+    } else {
+      naf[i] = digit - (1 << WINDOW);
+      carry = 1;
+    }
+    i += WINDOW;
+  }
+  naf
+}
+
+/// `point * scalar`, in variable time, where `naf` is the scalar's non-adjacent form.
+pub(crate) fn mul_vartime<G: Group>(point: G, naf: &[i8]) -> G {
+  let double = point.double();
+  let mut odd = [point; 8];
+  for i in 1 .. odd.len() {
+    odd[i] = odd[i - 1] + double;
+  }
+  let mut res = G::identity();
+  for digit in naf.iter().rev() {
+    res = res.double();
+    let i = usize::from(digit.unsigned_abs() / 2);
+    if *digit > 0 {
+      res += odd[i];
+    } else if *digit < 0 {
+      res -= odd[i];
+    }
+  }
+  res
+}
+
 impl<C: Ciphersuite> IpStatement<'_, C>
 where
   C::F: FromUniformBytes<64>,
@@ -110,48 +163,49 @@ where
   ///
   /// This function executes in constant-time to all secrets as the witness is not considered a
   /// secret (as a Bulletproof is not a zero-knowledge proof).
+  ///
+  /// The `h_bold` weights must be the powers of a scalar, starting with one.
   pub(crate) fn prove(
     self,
     transcript: &mut Transcript,
     witness: IpWitness<C>,
   ) -> Result<(), IpProveError> {
-    let (mut g_bold, mut h_bold, u, mut P, mut a, mut b) = {
-      let IpStatement { generators, h_bold_weights, u, P } = self;
-      let u = generators.g() * u;
+    let IpStatement { generators, h_bold_weights, u, P } = self;
+    let u = generators.g() * u;
 
-      // Ensure we have the necessary amount of generators
-      if witness.a.len() > ((usize::MAX >> 1) + 1) {
-        Err(IpProveError::IncorrectAmountOfGenerators)?;
-      }
-      if generators.g_bold_slice().len() < witness.a.len().next_power_of_two() {
-        Err(IpProveError::IncorrectAmountOfGenerators)?;
-      }
-      // Acquire a local copy of the generators
-      let g_bold = PointVector::<C>(generators.g_bold_slice().to_vec());
-      let h_bold = PointVector::<C>(generators.h_bold_slice().to_vec()).mul_vec(&h_bold_weights);
-
-      let IpWitness { a, b } = witness;
-
-      let P = match P {
-        P::Prover(point) => point,
-        P::Verifier { .. } => {
-          panic!("prove called with a P specification which was for the verifier")
-        }
-      };
-
-      // Ensure this witness actually opens this statement
-      #[cfg(debug_assertions)]
-      {
-        let ag = a.0.iter().copied().zip(g_bold.0.iter().copied());
-        let bh = b.0.iter().copied().zip(h_bold.0.iter().copied());
-        let cu = core::iter::once((a.inner_product(b.0.iter()), u));
-        if P != multiexp_vartime(&ag.chain(bh).chain(cu).collect::<Vec<_>>()) {
+    // Ensure we have the necessary amount of generators
+    if witness.a.len() > ((usize::MAX >> 1) + 1) {
+      Err(IpProveError::IncorrectAmountOfGenerators)?;
+    }
+    if generators.g_bold_slice().len() < witness.a.len().next_power_of_two() {
+      Err(IpProveError::IncorrectAmountOfGenerators)?;
+    }
+    assert!(
+      matches!(P, P::Prover),
+      "prove called with a P specification which was for the verifier"
+    );
+    {
+      let ratio = h_bold_weights.0.get(1).copied().unwrap_or(C::F::ONE);
+      let mut expected = C::F::ONE;
+      for weight in &h_bold_weights.0 {
+        if *weight != expected {
           Err(IpProveError::InconsistentWitness)?;
         }
+        expected *= ratio;
       }
+    }
 
-      (g_bold, h_bold, u, P, a, b)
-    };
+    /*
+      The generators are represented as `g_weight * g_bold[i]` and `h_weights[i] * h_bold[i]`.
+      As the weights are geometric, folding the second half into the first is one multiplication
+      by a public scalar per generator.
+    */
+    let mut g_bold = generators.g_bold_slice().to_vec();
+    let mut h_bold = generators.h_bold_slice().to_vec();
+    let mut g_weight = C::F::ONE;
+    let mut h_weights = h_bold_weights.0.clone();
+
+    let IpWitness { mut a, mut b } = witness;
 
     // `else: (n > 1)` case, lines 18-35 of the Bulletproofs paper
     // This interprets `g_bold.len()` as `n`
@@ -161,32 +215,25 @@ where
       let (a1, a2) = a.split(split_at);
       let (b1, b2) = b.split(split_at);
 
-      let (g_bold1, g_bold2) = g_bold.split();
-      let (h_bold1, h_bold2) = h_bold.split();
-
-      let n_hat = g_bold1.len();
+      let n_hat = g_bold.len() / 2;
 
       // Sanity
       debug_assert_eq!(a1.len(), n_hat);
       debug_assert!(a2.len() <= n_hat);
       debug_assert_eq!(b1.len(), n_hat);
       debug_assert!(b2.len() <= n_hat);
-      debug_assert_eq!(g_bold1.len(), n_hat);
-      debug_assert_eq!(g_bold2.len(), n_hat);
-      debug_assert_eq!(h_bold1.len(), n_hat);
-      debug_assert_eq!(h_bold2.len(), n_hat);
 
       // cl, cr, lines 21-22
       let cl = b2.inner_product_without_length_checks(a1.0.iter());
       let cr = a2.inner_product_without_length_checks(b1.0.iter());
 
       let L = {
-        let mut L_terms = Vec::with_capacity(1 + (2 * g_bold1.len()));
-        for (a, g) in a1.0.iter().zip(g_bold2.0.iter()) {
-          L_terms.push((*a, *g));
+        let mut L_terms = Vec::with_capacity(1 + (2 * n_hat));
+        for (a, g) in a1.0.iter().zip(&g_bold[n_hat ..]) {
+          L_terms.push((*a * g_weight, *g));
         }
-        for (b, h) in b2.0.iter().zip(h_bold1.0.iter()) {
-          L_terms.push((*b, *h));
+        for ((b, h), weight) in b2.0.iter().zip(&h_bold[.. n_hat]).zip(&h_weights) {
+          L_terms.push((*b * weight, *h));
         }
         L_terms.push((cl, u));
         // Uses vartime since this isn't a ZK proof
@@ -194,12 +241,12 @@ where
       };
 
       let R = {
-        let mut R_terms = Vec::with_capacity(1 + (2 * g_bold1.len()));
-        for (a, g) in a2.0.iter().zip(g_bold1.0.iter()) {
-          R_terms.push((*a, *g));
+        let mut R_terms = Vec::with_capacity(1 + (2 * n_hat));
+        for (a, g) in a2.0.iter().zip(&g_bold[.. n_hat]) {
+          R_terms.push((*a * g_weight, *g));
         }
-        for (b, h) in b1.0.iter().zip(h_bold2.0.iter()) {
-          R_terms.push((*b, *h));
+        for ((b, h), weight) in b1.0.iter().zip(&h_bold[n_hat ..]).zip(&h_weights[n_hat ..]) {
+          R_terms.push((*b * weight, *h));
         }
         R_terms.push((cr, u));
         multiexp_vartime(&R_terms)
@@ -212,15 +259,24 @@ where
       let x_inv = x.invert().expect("transcript challenge was 0");
 
       // The prover and verifier now calculate the following (28-31)
-      g_bold = PointVector(Vec::with_capacity(g_bold1.len()));
-      for (a, b) in g_bold1.0.into_iter().zip(g_bold2.0) {
-        g_bold.0.push(multiexp_vartime(&[(x_inv, a), (x, b)]));
+      // `g_bold[i] x_inv + g_bold[n_hat + i] x`, `h_bold[i] x + h_bold[n_hat + i] x_inv`
+      let g_naf = wnaf(&x.square());
+      let h_naf = wnaf(&(x_inv.square() * h_bold_weights[n_hat]));
+      let (g_bold1, g_bold2) = g_bold.split_at_mut(n_hat);
+      for (g1, g2) in g_bold1.iter_mut().zip(g_bold2.iter()) {
+        *g1 += mul_vartime(*g2, &g_naf);
       }
-      h_bold = PointVector(Vec::with_capacity(h_bold1.len()));
-      for (a, b) in h_bold1.0.into_iter().zip(h_bold2.0) {
-        h_bold.0.push(multiexp_vartime(&[(x, a), (x_inv, b)]));
+      let (h_bold1, h_bold2) = h_bold.split_at_mut(n_hat);
+      for (h1, h2) in h_bold1.iter_mut().zip(h_bold2.iter()) {
+        *h1 += mul_vartime(*h2, &h_naf);
       }
-      P = (L * (x * x)) + P + (R * (x_inv * x_inv));
+      g_bold.truncate(n_hat);
+      h_bold.truncate(n_hat);
+      g_weight *= x_inv;
+      h_weights.truncate(n_hat);
+      for weight in &mut h_weights {
+        *weight *= x;
+      }
 
       // 32-34
       a = a1 * x;
@@ -334,7 +390,7 @@ where
     }
 
     let weight = match P {
-      P::Prover(_) => panic!("prove called with a P specification which was for the prover"),
+      P::Prover => panic!("prove called with a P specification which was for the prover"),
       P::Verifier { verifier_weight } => verifier_weight,
     };
 

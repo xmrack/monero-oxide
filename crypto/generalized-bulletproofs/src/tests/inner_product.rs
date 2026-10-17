@@ -10,14 +10,12 @@ use ciphersuite::{
 use crate::{
   ScalarVector, PointVector, Generators,
   transcript::*,
-  inner_product::{P, IpStatement, IpWitness},
+  inner_product::{P, IpStatement, IpWitness, IpProveError, wnaf, mul_vartime},
   tests::insecure_test_generators,
 };
 
 #[test]
 fn test_zero_inner_product() {
-  let P = <Ristretto as Ciphersuite>::G::identity();
-
   let generators = insecure_test_generators::<_, Ristretto>(&mut OsRng, 1).unwrap();
   let reduced = generators.reduce(1).unwrap();
   let witness = IpWitness::<Ristretto>::new(
@@ -32,7 +30,7 @@ fn test_zero_inner_product() {
       reduced,
       ScalarVector(vec![<Ristretto as Ciphersuite>::F::ONE; 1]),
       <Ristretto as Ciphersuite>::F::ONE,
-      P::Prover(P),
+      P::Prover,
     )
     .unwrap()
     .clone()
@@ -59,7 +57,9 @@ fn test_inner_product() {
   // P = sum(g_bold * a, h_bold * b)
   let generators = insecure_test_generators::<_, Ristretto>(&mut OsRng, 32).unwrap();
   let mut verifier = Generators::batch_verifier();
-  for i in 1 ..= 32 {
+  let y = <Ristretto as Ciphersuite>::F::random(&mut OsRng);
+  for i in 1 ..= 32_usize {
+    let weights = ScalarVector::powers(y, i.next_power_of_two());
     let generators = generators.reduce(i).unwrap();
     let g = generators.g();
     assert_eq!(generators.len(), i.next_power_of_two());
@@ -80,7 +80,9 @@ fn test_inner_product() {
       b[i] = <Ristretto as Ciphersuite>::F::random(&mut OsRng);
     }
 
-    let P = g_bold.multiexp(&a) + h_bold.multiexp(&b) + (g * a.inner_product(b.0.iter()));
+    let P = g_bold.multiexp(&a) +
+      h_bold.mul_vec(&weights).multiexp(&b) +
+      (g * a.inner_product(b.0.iter()));
 
     let witness = IpWitness::<Ristretto>::new(a, b).unwrap();
 
@@ -88,9 +90,9 @@ fn test_inner_product() {
       let mut transcript = Transcript::new([0; 32]);
       IpStatement::<Ristretto>::new(
         generators,
-        ScalarVector(vec![<Ristretto as Ciphersuite>::F::ONE; i.next_power_of_two()]),
+        weights.clone(),
         <Ristretto as Ciphersuite>::F::ONE,
-        P::Prover(P),
+        P::Prover,
       )
       .unwrap()
       .prove(&mut transcript, witness)
@@ -101,7 +103,7 @@ fn test_inner_product() {
     verifier.additional.push((<Ristretto as Ciphersuite>::F::ONE, P));
     IpStatement::<Ristretto>::new(
       generators,
-      ScalarVector(vec![<Ristretto as Ciphersuite>::F::ONE; i.next_power_of_two()]),
+      weights,
       <Ristretto as Ciphersuite>::F::ONE,
       P::Verifier { verifier_weight: <Ristretto as Ciphersuite>::F::ONE },
     )
@@ -110,4 +112,53 @@ fn test_inner_product() {
     .unwrap();
   }
   assert!(generators.verify(verifier));
+}
+
+#[test]
+fn test_inner_product_weights() {
+  let generators = insecure_test_generators::<_, Ristretto>(&mut OsRng, 4).unwrap();
+  let generators = generators.reduce(4).unwrap();
+  let mut weights = ScalarVector::powers(<Ristretto as Ciphersuite>::F::random(&mut OsRng), 4);
+  weights[3] += <Ristretto as Ciphersuite>::F::ONE;
+  let witness = IpWitness::<Ristretto>::new(
+    ScalarVector::<<Ristretto as Ciphersuite>::F>::new(4),
+    ScalarVector::<<Ristretto as Ciphersuite>::F>::new(4),
+  )
+  .unwrap();
+  assert_eq!(
+    IpStatement::<Ristretto>::new(
+      generators,
+      weights,
+      <Ristretto as Ciphersuite>::F::ONE,
+      P::Prover
+    )
+    .unwrap()
+    .prove(&mut Transcript::new([0; 32]), witness),
+    Err(IpProveError::InconsistentWitness)
+  );
+}
+
+#[test]
+fn test_mul_vartime() {
+  let point = <Ristretto as Ciphersuite>::G::random(&mut OsRng);
+  let mut scalars = vec![
+    <Ristretto as Ciphersuite>::F::ZERO,
+    <Ristretto as Ciphersuite>::F::ONE,
+    -<Ristretto as Ciphersuite>::F::ONE,
+    <Ristretto as Ciphersuite>::F::from(15u64),
+    <Ristretto as Ciphersuite>::F::from(16u64),
+    <Ristretto as Ciphersuite>::F::from(17u64),
+    <Ristretto as Ciphersuite>::F::from(31u64),
+    <Ristretto as Ciphersuite>::F::from(32u64),
+    <Ristretto as Ciphersuite>::F::from(u64::MAX),
+    <Ristretto as Ciphersuite>::F::from(2u64).pow_vartime([252]) -
+      <Ristretto as Ciphersuite>::F::ONE,
+    <Ristretto as Ciphersuite>::F::from(2u64).pow_vartime([252]),
+  ];
+  for _ in 0 .. 64 {
+    scalars.push(<Ristretto as Ciphersuite>::F::random(&mut OsRng));
+  }
+  for scalar in scalars {
+    assert_eq!(mul_vartime(point, &wnaf(&scalar)), point * scalar);
+  }
 }
