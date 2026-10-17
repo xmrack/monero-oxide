@@ -7,7 +7,7 @@ use rand_core::{RngCore, CryptoRng};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 use subtle::ConditionallySelectable;
 
-use multiexp::{multiexp, multiexp_vartime};
+use multiexp::multiexp;
 use ciphersuite::{
   group::ff::{Field as _, FromUniformBytes},
   Ciphersuite,
@@ -15,7 +15,7 @@ use ciphersuite::{
 
 use crate::{
   ScalarVector, PointVector, ProofGenerators, PedersenCommitment, PedersenVectorCommitment,
-  BatchVerifier,
+  BatchVerifier, threads,
   transcript::*,
   lincomb::accumulate_vector,
   inner_product::{IpProveError, IpVerifyError, IpStatement, IpWitness, P},
@@ -246,7 +246,21 @@ where
     self,
     rng: &mut R,
     transcript: &mut Transcript,
+    witness: ArithmeticCircuitWitness<C>,
+  ) -> Result<(), AcProveError> {
+    self.prove_with_threads(rng, transcript, witness, 1)
+  }
+
+  /// Prove for this statement/witness, using up to `threads` threads (bounded by `MAX_THREADS`).
+  ///
+  /// The proof is identical to the one produced by `prove`. Threads are only used with the `std`
+  /// feature.
+  pub fn prove_with_threads<R: RngCore + CryptoRng>(
+    self,
+    rng: &mut R,
+    transcript: &mut Transcript,
     mut witness: ArithmeticCircuitWitness<C>,
+    threads: usize,
   ) -> Result<(), AcProveError> {
     let n = self.n();
     let c = self.c();
@@ -344,7 +358,7 @@ where
       let arh = witness.aR.0.iter().enumerate().map(|(i, aR)| (*aR, self.generators.h_bold(i)));
       let ah = core::iter::once((alpha, self.generators.h()));
       let mut AI_terms = alg.chain(arh).chain(ah).collect::<Vec<_>>();
-      let AI = multiexp(&AI_terms);
+      let AI = threads::multiexp(threads, &AI_terms);
       AI_terms.zeroize();
       AI
     };
@@ -352,7 +366,7 @@ where
       let aog = witness.aO.0.iter().enumerate().map(|(i, aO)| (*aO, self.generators.g_bold(i)));
       let bh = core::iter::once((beta, self.generators.h()));
       let mut AO_terms = aog.chain(bh).collect::<Vec<_>>();
-      let AO = multiexp(&AO_terms);
+      let AO = threads::multiexp(threads, &AO_terms);
       AO_terms.zeroize();
       AO
     };
@@ -368,7 +382,7 @@ where
       let srh = sR.0.iter().enumerate().map(|(i, sR)| (*sR, self.generators.h_bold(i)));
       let rh = core::iter::once((rho, self.generators.h()));
       let mut S_terms = slg.chain(srh).chain(rh).collect::<Vec<_>>();
-      let S = multiexp(&S_terms);
+      let S = threads::multiexp(threads, &S_terms);
       S_terms.zeroize();
       S
     };
@@ -540,11 +554,20 @@ where
       tau_after_ni.push(C::F::random(&mut *rng));
     }
     // Calculate commitments to the coefficients of `t`, blinded by `tau`
-    for (t, tau) in t.0[(ni / 2) .. ni].iter().zip(tau_before_ni.iter()) {
-      transcript.push_point(&multiexp(&[(*t, self.generators.g()), (*tau, self.generators.h())]));
-    }
-    for (t, tau) in t.0[(ni + 1) ..].iter().zip(tau_after_ni.iter()) {
-      transcript.push_point(&multiexp(&[(*t, self.generators.g()), (*tau, self.generators.h())]));
+    let T = t.0[(ni / 2) .. ni]
+      .iter()
+      .zip(tau_before_ni.iter())
+      .chain(t.0[(ni + 1) ..].iter().zip(tau_after_ni.iter()))
+      .collect::<Vec<_>>();
+    for T in threads::map_ranges(threads, T.len(), 4, |range| {
+      T[range]
+        .iter()
+        .map(|(t, tau)| multiexp(&[(**t, self.generators.g()), (**tau, self.generators.h())]))
+        .collect::<Vec<_>>()
+    })
+    .concat()
+    {
+      transcript.push_point(&T);
     }
 
     let x: ScalarVector<C::F> = ScalarVector::powers(transcript.challenge::<C>(), t.len());
@@ -623,10 +646,10 @@ where
       y_inv,
       ip_x,
       // Safe since IpStatement isn't a ZK proof
-      P::Prover(multiexp_vartime(&P_terms)),
+      P::Prover(threads::multiexp_vartime(threads, &P_terms)),
     )
     .expect("created an invalid IpStatement")
-    .prove(transcript, IpWitness::new(l, r).expect("created an invalid IpWitness"))
+    .prove(transcript, IpWitness::new(l, r).expect("created an invalid IpWitness"), threads)
     .map_err(|e| match e {
       IpProveError::IncorrectAmountOfGenerators => AcProveError::IncorrectAmountOfGenerators,
       IpProveError::InconsistentWitness => AcProveError::InconsistentWitness,

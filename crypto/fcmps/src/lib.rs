@@ -522,12 +522,30 @@ where
   ///
   /// This functions runs in variable-time for paths which aren't full (paths which run along the
   /// latest edge of the tree).
-  // We want to consume the single-use `BranchesWithBlinds`, hence `needless_pass_by_value`
-  #[allow(clippy::needless_pass_by_value)]
   pub fn prove<R: RngCore + CryptoRng>(
     rng: &mut R,
     params: &FcmpParams<C>,
     branches: BranchesWithBlinds<C>,
+  ) -> Result<Self, FcmpError>
+  where
+    <C::C1 as Ciphersuite>::G: GroupEncoding<Repr = [u8; 32]>,
+    <C::C2 as Ciphersuite>::G: GroupEncoding<Repr = [u8; 32]>,
+  {
+    Self::prove_with_threads(rng, params, branches, 1)
+  }
+
+  /// Prove a FCMP, using up to `threads` threads (bounded by
+  /// `generalized_bulletproofs::MAX_THREADS`).
+  ///
+  /// The proof is identical to the one produced by `prove`. Threads are only used with the `std`
+  /// feature.
+  // We want to consume the single-use `BranchesWithBlinds`, hence `needless_pass_by_value`
+  #[allow(clippy::needless_pass_by_value)]
+  pub fn prove_with_threads<R: RngCore + CryptoRng>(
+    rng: &mut R,
+    params: &FcmpParams<C>,
+    branches: BranchesWithBlinds<C>,
+    threads: usize,
   ) -> Result<Self, FcmpError>
   where
     <C::C1 as Ciphersuite>::G: GroupEncoding<Repr = [u8; 32]>,
@@ -613,8 +631,8 @@ where
     }
 
     // Actually commit
-    let commitments_1 = c1_tape.commit(&params.curve_1_generators, &pvc_blinds_1);
-    let commitments_2 = c2_tape.commit(&params.curve_2_generators, &pvc_blinds_2);
+    let commitments_1 = c1_tape.commit(&params.curve_1_generators, &pvc_blinds_1, threads);
+    let commitments_2 = c2_tape.commit(&params.curve_2_generators, &pvc_blinds_2, threads);
 
     // Decide the nonce which will be used for proving knowledge of the tree root blind
     let mut root_blind_r_C1 = None;
@@ -728,7 +746,7 @@ where
       params.curve_1_generators.reduce(c1_padded_pow_2).ok_or(FcmpError::NotEnoughGenerators)?,
       commitments_1,
     )?;
-    c1_statement.prove(rng, &mut transcript, c1_witness.unwrap())?;
+    c1_statement.prove_with_threads(rng, &mut transcript, c1_witness.unwrap(), threads)?;
 
     // This circuit may be empty, meaning we don't have to prove a Bulletproof for it
     // It should only be empty in negligible environments and at worst is an inefficiency so it's
@@ -737,7 +755,7 @@ where
       params.curve_2_generators.reduce(c2_padded_pow_2).ok_or(FcmpError::NotEnoughGenerators)?,
       commitments_2,
     )?;
-    c2_statement.prove(rng, &mut transcript, c2_witness.unwrap())?;
+    c2_statement.prove_with_threads(rng, &mut transcript, c2_witness.unwrap(), threads)?;
 
     let res = Fcmp { _curves: PhantomData, proof: transcript.complete(), root_blind_pok };
     debug_assert_eq!(res.proof.len() + 64, Self::proof_size(inputs, layers));

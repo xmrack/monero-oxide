@@ -28,6 +28,9 @@ pub(crate) mod inner_product;
 
 pub(crate) mod lincomb;
 
+mod threads;
+pub use threads::MAX_THREADS;
+
 /// The arithmetic circuit proof.
 pub mod arithmetic_circuit_proof;
 
@@ -258,6 +261,51 @@ impl<C: Ciphersuite> Generators<C> {
       g_bold: &self.g_bold[.. generators],
       h_bold: &self.h_bold[.. generators],
     })
+  }
+
+  /// Calculate the Pedersen vector commitments `sum(values[i] * g_bold[i]) + mask * h`, using up
+  /// to `threads` threads.
+  ///
+  /// Each commitment is specified as `(values, mask)`. Returns `None` if there are more values than
+  /// `g` (bold) generators. Threads are only used with the `std` feature.
+  #[allow(clippy::type_complexity)]
+  pub fn vector_commitments(
+    &self,
+    commitments: &[(&[C::F], &C::F)],
+    threads: usize,
+  ) -> Option<Vec<C::G>>
+  where
+    C::G: ConditionallySelectable,
+  {
+    if commitments.iter().any(|(values, _)| values.len() > self.g_bold.len()) {
+      None?;
+    }
+    // Assign the commitments to threads in an interleaved fashion to balance the work
+    let threads = threads.clamp(1, MAX_THREADS).min(commitments.len()).max(1);
+    let mut res = vec![C::G::identity(); commitments.len()];
+    let parts = threads::map_ranges(threads, threads, 1, |range| {
+      range
+        .flat_map(|t| (t .. commitments.len()).step_by(threads))
+        .map(|i| {
+          let (values, mask) = commitments[i];
+          let mut terms = values
+            .iter()
+            .copied()
+            .zip(self.g_bold.iter().copied())
+            .chain(core::iter::once((*mask, self.h)))
+            .collect::<Vec<_>>();
+          let commitment = multiexp(&terms);
+          terms.zeroize();
+          (i, commitment)
+        })
+        .collect::<Vec<_>>()
+    });
+    for part in parts {
+      for (i, commitment) in part {
+        res[i] = commitment;
+      }
+    }
+    Some(res)
   }
 }
 

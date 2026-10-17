@@ -7,7 +7,6 @@ use zeroize::Zeroize;
 
 use generic_array::{typenum::Unsigned as _, GenericArray};
 
-use multiexp::multiexp;
 use ciphersuite::{group::ff::PrimeFieldBits, Ciphersuite};
 
 use ec_divisors::Poly;
@@ -239,21 +238,24 @@ impl<F: Zeroize + PrimeFieldBits> VectorCommitmentTape<F> {
     &self,
     generators: &Generators<C>,
     blinds: &[C::F],
+    threads: usize,
   ) -> Vec<C::G> {
     assert_eq!(self.commitments.len(), blinds.len());
 
-    let mut res = Vec::with_capacity(self.commitments.len());
-    for (i, (values, blind)) in self.commitments.iter().zip(blinds).enumerate() {
-      let g_generators = generators.g_bold_slice()[.. values.len()].iter().copied();
-      let commitment = g_generators.enumerate().map(|(i, g)| (values[i], g));
-      let mut commitment = if let Some(branch_length) = self.branch_lengths.get(i) {
-        commitment.take(*branch_length).collect::<Vec<_>>()
-      } else {
-        commitment.collect::<Vec<_>>()
-      };
-      commitment.push((*blind, generators.h()));
-      res.push(multiexp(&commitment));
-    }
-    res
+    let commitments = self
+      .commitments
+      .iter()
+      .zip(blinds)
+      .enumerate()
+      .map(|(i, (values, blind))| {
+        let values = if let Some(branch_length) = self.branch_lengths.get(i) {
+          &values[.. (*branch_length).min(values.len())]
+        } else {
+          values.as_slice()
+        };
+        (values, blind)
+      })
+      .collect::<Vec<_>>();
+    generators.vector_commitments(&commitments, threads).unwrap()
   }
 }

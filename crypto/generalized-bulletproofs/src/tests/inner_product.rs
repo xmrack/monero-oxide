@@ -36,7 +36,7 @@ fn test_zero_inner_product() {
     )
     .unwrap()
     .clone()
-    .prove(&mut transcript, witness)
+    .prove(&mut transcript, witness, 1)
     .unwrap();
     transcript.complete()
   };
@@ -93,7 +93,7 @@ fn test_inner_product() {
         P::Prover(P),
       )
       .unwrap()
-      .prove(&mut transcript, witness)
+      .prove(&mut transcript, witness, 1)
       .unwrap();
       transcript.complete()
     };

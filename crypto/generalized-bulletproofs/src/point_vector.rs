@@ -5,6 +5,7 @@ use zeroize::Zeroize;
 
 use ciphersuite::Ciphersuite;
 
+#[cfg(test)]
 use crate::ScalarVector;
 
 /// A point vector struct with the functionality necessary for Bulletproofs.
@@ -75,21 +76,6 @@ impl<C: Ciphersuite> PointVector<C> {
     debug_assert_eq!(self.len(), vector.len(), "subtracting point vectors of different lengths");
     for (i, val) in self.0.iter_mut().enumerate() {
       *val -= vector.0[i];
-    }
-    self
-  }
-
-  /// Scales the points in this vector by the corresponding scalars within the scalar vector.
-  ///
-  /// May panic if the vectors are different lengths.
-  pub(crate) fn mul_vec(mut self, vector: &ScalarVector<C::F>) -> Self {
-    debug_assert_eq!(
-      self.len(),
-      vector.len(),
-      "scaling a point vector by a scalar vector of a different length"
-    );
-    for (i, val) in self.0.iter_mut().enumerate() {
-      *val *= vector.0[i];
     }
     self
   }

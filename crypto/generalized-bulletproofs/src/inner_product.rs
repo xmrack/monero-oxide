@@ -8,7 +8,11 @@ use ciphersuite::{
   Ciphersuite,
 };
 
-use crate::{ScalarVector, PointVector, ProofGenerators, BatchVerifier, transcript::*};
+use crate::{
+  threads::{self, map_ranges},
+  ScalarVector, PointVector, ProofGenerators, BatchVerifier,
+  transcript::*,
+};
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) enum P<C: Ciphersuite> {
@@ -114,6 +118,7 @@ where
     self,
     transcript: &mut Transcript,
     witness: IpWitness<C>,
+    threads: usize,
   ) -> Result<(), IpProveError> {
     let (mut g_bold, mut h_bold, u, mut P, mut a, mut b) = {
       let IpStatement { generators, h_bold_weights, u, P } = self;
@@ -128,7 +133,16 @@ where
       }
       // Acquire a local copy of the generators
       let g_bold = PointVector::<C>(generators.g_bold_slice().to_vec());
-      let h_bold = PointVector::<C>(generators.h_bold_slice().to_vec()).mul_vec(&h_bold_weights);
+      let h_bold = PointVector::<C>(
+        map_ranges(threads, h_bold_weights.len(), 32, |range| {
+          generators.h_bold_slice()[range.clone()]
+            .iter()
+            .zip(&h_bold_weights.0[range])
+            .map(|(h, weight)| *h * weight)
+            .collect::<Vec<_>>()
+        })
+        .concat(),
+      );
 
       let IpWitness { a, b } = witness;
 
@@ -190,7 +204,7 @@ where
         }
         L_terms.push((cl, u));
         // Uses vartime since this isn't a ZK proof
-        multiexp_vartime(&L_terms)
+        threads::multiexp_vartime(threads, &L_terms)
       };
 
       let R = {
@@ -202,7 +216,7 @@ where
           R_terms.push((*b, *h));
         }
         R_terms.push((cr, u));
-        multiexp_vartime(&R_terms)
+        threads::multiexp_vartime(threads, &R_terms)
       };
 
       // Now that we've calculate L, R, transcript them to receive x (26-27)
@@ -212,14 +226,20 @@ where
       let x_inv = x.invert().expect("transcript challenge was 0");
 
       // The prover and verifier now calculate the following (28-31)
-      g_bold = PointVector(Vec::with_capacity(g_bold1.len()));
-      for (a, b) in g_bold1.0.into_iter().zip(g_bold2.0) {
-        g_bold.0.push(multiexp_vartime(&[(x_inv, a), (x, b)]));
-      }
-      h_bold = PointVector(Vec::with_capacity(h_bold1.len()));
-      for (a, b) in h_bold1.0.into_iter().zip(h_bold2.0) {
-        h_bold.0.push(multiexp_vartime(&[(x, a), (x_inv, b)]));
-      }
+      let fold = |first: &[C::G], second: &[C::G], x: C::F, y: C::F| {
+        PointVector(
+          map_ranges(threads, n_hat, 32, |range| {
+            first[range.clone()]
+              .iter()
+              .zip(&second[range])
+              .map(|(a, b)| multiexp_vartime(&[(x, *a), (y, *b)]))
+              .collect::<Vec<_>>()
+          })
+          .concat(),
+        )
+      };
+      g_bold = fold(&g_bold1.0, &g_bold2.0, x_inv, x);
+      h_bold = fold(&h_bold1.0, &h_bold2.0, x, x_inv);
       P = (L * (x * x)) + P + (R * (x_inv * x_inv));
 
       // 32-34
