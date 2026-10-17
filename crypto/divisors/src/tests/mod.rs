@@ -8,7 +8,7 @@ use group::{
 };
 use dalek_ff_group::{EdwardsPoint, FieldElement};
 
-use crate::{DivisorCurve, Poly, new_divisor};
+use crate::{DivisorCurve, Poly, ScalarDecomposition, new_divisor, new_divisor_coefficients};
 
 mod poly;
 
@@ -62,6 +62,7 @@ fn check_divisor<C: DivisorCurve>(points: Vec<C>) {
 
   // Create the divisor
   let divisor = new_divisor::<C>(&points_xy, precomputation.borrow()).unwrap();
+  assert_eq!(new_divisor_coefficients::<C>(&points_xy).unwrap(), divisor);
   let eval = |c| {
     let (x, y) = C::to_xy(c).unwrap();
     divisor.eval(x, y)
@@ -100,6 +101,7 @@ fn test_divisor<C: DivisorCurve>() {
     let points_xy = points_xy(&points);
     // Create the divisor
     let divisor = new_divisor::<C>(&points_xy, precomputation.borrow()).unwrap();
+    assert_eq!(new_divisor_coefficients::<C>(&points_xy).unwrap(), divisor);
 
     // For a divisor interpolating 256 points, as one does when interpreting a 255-bit discrete log
     // with the result of its scalar multiplication against a fixed generator, the lengths of the
@@ -197,6 +199,40 @@ fn test_divisor<C: DivisorCurve>() {
   }
 }
 
+fn test_scalar_mul_divisor<C: DivisorCurve>()
+where
+  C::Scalar: zeroize::Zeroize + group::ff::PrimeFieldBits,
+{
+  let precomputation = C::interpolator_for_scalar_mul();
+  let generator = C::random(&mut OsRng);
+  let mut scalars = vec![C::Scalar::ONE, -C::Scalar::ONE, C::Scalar::from(2u64)];
+  let mut pow = C::Scalar::ONE;
+  for _ in 0 .. C::Scalar::NUM_BITS {
+    scalars.push(pow);
+    scalars.push(-pow);
+    pow = pow.double();
+  }
+  for i in 3 .. 600u64 {
+    scalars.push(C::Scalar::from(i));
+  }
+  for _ in 0 .. 64 {
+    scalars.push(C::Scalar::random(&mut OsRng));
+  }
+  for scalar in scalars {
+    let decomposition = ScalarDecomposition::new(scalar).unwrap();
+    let mut points = vec![-(generator * scalar)];
+    let mut power = generator;
+    for coefficient in decomposition.decomposition() {
+      for _ in 0 .. *coefficient {
+        points.push(power);
+      }
+      power = power.double();
+    }
+    let expected = new_divisor::<C>(&points_xy(&points), precomputation.borrow()).unwrap();
+    assert_eq!(decomposition.scalar_mul_divisor(generator), expected);
+  }
+}
+
 fn test_same_point<C: DivisorCurve>() {
   let mut points = vec![C::random(&mut OsRng)];
   points.push(points[0]);
@@ -273,6 +309,7 @@ fn test_divisor_ed25519() {
   test_same_point::<EdwardsPoint>();
   test_subset_sum_to_infinity::<EdwardsPoint>();
   test_divisor::<EdwardsPoint>();
+  test_scalar_mul_divisor::<EdwardsPoint>();
 }
 
 #[test]

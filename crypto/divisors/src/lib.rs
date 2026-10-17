@@ -22,6 +22,8 @@ pub use barycentric::Interpolator;
 
 mod divisor;
 use divisor::{SmallDivisor, Divisor};
+mod coeff;
+use coeff::CoeffDivisor;
 
 mod ec;
 pub use ec::{Projective, XyPoint};
@@ -351,6 +353,74 @@ pub fn new_divisor<C: DivisorCurve>(
   Some(divisor)
 }
 
+/// Create a divisor interpolating the following points, as `new_divisor` does, without
+/// evaluations or interpolation.
+///
+/// The product tree is formed over coefficients and the vertical lines are removed by exact
+/// division. If the arguments were valid, this function executes in an amount of time constant to
+/// the amount of points.
+fn new_divisor_coefficients<C: DivisorCurve>(
+  points: &[C::XyPoint],
+) -> Option<Poly<C::FieldElement>> {
+  let mut invalid_args = (points.len() & (!1)).ct_eq(&0);
+  let sum = points.iter().copied().reduce(C::XyPoint::add).unwrap_or(C::XyPoint::IDENTITY);
+  invalid_args |= !sum.is_identity();
+  for point in points {
+    invalid_args |= point.is_identity();
+  }
+  if bool::from(invalid_args) {
+    None?;
+  }
+
+  let points_len = points.len();
+  let curve = (C::a(), C::b());
+
+  // Each divisor is paired with the amount of points it interpolates
+  let mut divs = vec![];
+  let mut all_lines = lines_and_denoms::<C>(points).into_iter();
+  for i in 0 .. ((points_len / 2) + (points_len % 2)) {
+    let (line, _) = all_lines.next().unwrap();
+    let points = if ((2 * i) + 1) < points_len { 2 } else { 1 };
+    divs.push((CoeffDivisor::<C::FieldElement>::from_small(&line), points));
+  }
+
+  while divs.len() > 1 {
+    let mut next_divs = vec![];
+    if (divs.len() % 2) == 1 {
+      next_divs.push(divs.pop().unwrap());
+    }
+
+    while let Some((a_div, a_points)) = divs.pop() {
+      let (b_div, b_points) = divs.pop().unwrap();
+      let (line, denom) = all_lines.next().unwrap();
+      // The merged function has a zero at each of these points and at the negation of their sum,
+      // and a pole of order `points + 1` at infinity
+      let points = a_points + b_points;
+      let lens = (((points + 1) / 2) + 1, (points / 2).max(1));
+      next_divs.push((CoeffDivisor::merge([a_div, b_div], &line, denom, curve, lens), points));
+    }
+
+    divs = next_divs;
+  }
+
+  let (divisor, _) = divs.remove(0);
+  let mut x_coefficients = divisor.a[1 ..].to_vec();
+  let mut yx_coefficients = divisor.b[1 ..].to_vec();
+  for (coeffs, len) in [
+    (&mut x_coefficients, points_len / 2),
+    (&mut yx_coefficients, points_len.div_ceil(2).saturating_sub(2)),
+  ] {
+    debug_assert!(coeffs.iter().skip(len).all(|coeff| bool::from(coeff.is_zero())));
+    coeffs.truncate(len);
+  }
+  Some(Poly {
+    y_coefficients: vec![divisor.b[0]],
+    yx_coefficients: vec![yx_coefficients],
+    x_coefficients,
+    zero_coefficient: divisor.a[0],
+  })
+}
+
 /// The decomposition of a scalar.
 ///
 /// The decomposition ($d$) of a scalar ($s$) has the following two properties:
@@ -520,8 +590,7 @@ impl<F: Zeroize + PrimeFieldBits> ScalarDecomposition<F> {
   ///
   /// This function executes in constant time with regards to the scalar.
   ///
-  /// This function MAY panic on integer overflow, if the generator is the point at infinity, or if
-  /// `C::interpolator_for_scalar_mul` is insufficient.
+  /// This function MAY panic on integer overflow or if the generator is the point at infinity.
   pub fn scalar_mul_divisor<C: Zeroize + DivisorCurve<Scalar = F>>(
     &self,
     generator: C,
@@ -552,7 +621,7 @@ impl<F: Zeroize + PrimeFieldBits> ScalarDecomposition<F> {
     }
 
     // Create a divisor out of the points
-    let res = new_divisor::<C>(&divisor_points, C::interpolator_for_scalar_mul().borrow()).unwrap();
+    let res = new_divisor_coefficients::<C>(&divisor_points).unwrap();
     divisor_points.zeroize();
     res
   }

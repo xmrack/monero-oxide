@@ -65,6 +65,11 @@ impl<F: PrimeField> SmallDivisor<F> {
   pub(super) fn new(x_coefficient: F, zero_coefficient: F, y_coefficient: F) -> Self {
     Self { x_coefficient, zero_coefficient, y_coefficient }
   }
+
+  /// The `(x, zero, y)` coefficients.
+  pub(super) fn coefficients(&self) -> (F, F, F) {
+    (self.x_coefficient, self.zero_coefficient, self.y_coefficient)
+  }
 }
 
 /// A function `f(x, y) = A(x) - yB(x)`.
