@@ -776,23 +776,15 @@ where
       }
       h_bold_scalars = h_bold_scalars + &(o_weights * x[jo]);
 
-      for i in 0 .. self.C.len() {
-        let mut cg = ScalarVector::new(n);
-        for (constraint, z) in self.constraints.iter().zip(&z.0) {
-          if let Some(WCG) = constraint.WCG().get(&i) {
-            accumulate_vector(&mut cg, WCG, *z);
-          }
-        }
-
-        // Push the terms for `C`, which increment from `0`, and the terms for `WC`, which
-        // decrement from `n'`
-        {
-          let C = self.C.0[i];
-          let WCG = cg;
-          let i = 1 + i;
-          let j = ni - i;
-          verifier.additional.push((x[j], C));
-          h_bold_scalars = h_bold_scalars + &(WCG * x[i]);
+      // Push the terms for `C`, which increment from `0`, and the terms for `WC`, which
+      // decrement from `n'`
+      for (i, C) in self.C.0.iter().enumerate() {
+        verifier.additional.push((x[ni - (1 + i)], *C));
+      }
+      // `new` bounds every `WCG` commitment index by `C.len()`
+      for (constraint, z) in self.constraints.iter().zip(&z.0) {
+        for (i, WCG) in constraint.WCG() {
+          accumulate_vector(&mut h_bold_scalars, WCG, *z * x[1 + i]);
         }
       }
 
