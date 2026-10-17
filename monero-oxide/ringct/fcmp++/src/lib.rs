@@ -34,6 +34,9 @@ use monero_fcmp_plus_plus_generators::{
 pub mod sal;
 use sal::*;
 
+/// Tree hashing with precomputed tables for the FCMP++ generators.
+pub mod tree;
+
 #[cfg(test)]
 mod tests;
 

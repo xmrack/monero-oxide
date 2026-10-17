@@ -1,4 +1,5 @@
 mod sal;
+mod tree;
 
 use rand_core::OsRng;
 
